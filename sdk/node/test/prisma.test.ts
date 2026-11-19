@@ -115,6 +115,25 @@ describe("prisma extension (real core, mocked query)", () => {
     assert.equal(currentTenant(), undefined);
   });
 
+  it("resolves the tenant per model: platform model + tenant-scoped nested model in one write", async () => {
+    const ext = cryplusExtension({
+      cryplus: cp,
+      schemaText: SCHEMA,
+      tenant: ({ model }) => (model === "Profile" ? "__platform__" : undefined),
+    }).query.$allModels.$allOperations as any;
+    const seen: any[] = [];
+    const call = (model: string, operation: string, args: any, result: any = null) =>
+      ext({ model, operation, args, query: async (a: any) => (seen.push(a), result) });
+    await withTenant("acme", () =>
+      call("User", "create", { data: { name: "n", notes: "secret", profile: { create: { id: "p", bio: "platform-scoped" } } } }),
+    );
+    const d = seen[0].data;
+    // notes is under "acme", the nested Profile.bio under "__platform__": each decrypts only under its own tenant
+    assert.equal(await cp.decrypt({ tenant: "acme", collection: "User", field: "notes" }, d.notes), "secret");
+    assert.equal(await cp.decrypt({ tenant: "__platform__", collection: "Profile", field: "bio" }, d.profile.create.bio), "platform-scoped");
+    await assert.rejects(cp.decrypt({ tenant: "acme", collection: "Profile", field: "bio" }, d.profile.create.bio), /decryption_failed/);
+  });
+
   it("passes through models and calls that touch nothing encrypted... but still needs tenant only when needed", async () => {
     const r = await run("User", "findMany", { where: { name: "x" } }, [{ id: "1", name: "x", cpf: null }]);
     assert.equal(r[0].name, "x");

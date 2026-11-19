@@ -1,0 +1,15 @@
+{
+  "name": "cryplus-prisma5-cjs",
+  "private": true,
+  "description": "Compatibility suite: Prisma 5.22 + plain JavaScript/CommonJS, the stack Operax runs.",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 e2e.test.js"
+  },
+  "dependencies": {
+    "@prisma/client": "5.22.0",
+    "cryplus": "file:../../sdk/node"
+  },
+  "devDependencies": {
+    "prisma": "5.22.0"
+  }
+}

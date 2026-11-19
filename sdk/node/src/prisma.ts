@@ -19,8 +19,12 @@ export interface PrismaOptions {
   /** Or the schema text itself. */
   schemaText?: string;
   /**
-   * Resolve the tenant for an operation. Defaults to the ambient tenant set by
-   * withTenant(). Throwing/returning nothing makes encrypted operations fail.
+   * Resolve the tenant for a model. Called once per model touched by an operation,
+   * with `model` set to the model whose field is being encrypted/decrypted (so nested
+   * writes and included relations are resolved per model). Return undefined to fall
+   * back to the ambient tenant set by withTenant(). If neither yields a tenant, the
+   * operation fails closed. Typical use: platform tables that exist before any tenant,
+   * e.g. `tenant: ({ model }) => (model === "Tenant" ? "__platform__" : undefined)`.
    */
   tenant?: (info: { model: string; operation: string; args: any }) => string | undefined | Promise<string | undefined>;
   /**
@@ -55,13 +59,13 @@ const maybeArray = async <T>(v: T | T[], fn: (e: T) => Promise<T>): Promise<T | 
 export class Transformer {
   readonly c: CryptoLike;
   readonly schema: Schema;
-  private resolveTenant: () => Promise<string>;
+  private resolveTenant: (model: string) => Promise<string>;
   readonly opts: { plaintext: "allow" | "reject"; hideIndexFields: boolean };
 
   constructor(
     c: CryptoLike,
     schema: Schema,
-    resolveTenant: () => Promise<string>,
+    resolveTenant: (model: string) => Promise<string>,
     opts: { plaintext: "allow" | "reject"; hideIndexFields: boolean },
   ) {
     this.c = c;
@@ -77,7 +81,7 @@ export class Transformer {
   }
 
   private async ctx(model: string, field: string) {
-    return { tenant: await this.resolveTenant(), collection: model, field };
+    return { tenant: await this.resolveTenant(model), collection: model, field };
   }
 
   async encryptValue(model: ModelInfo, enc: EncryptedField, plain: string) {
@@ -345,17 +349,23 @@ export function cryplusExtension(o: PrismaOptions) {
           const m = schema.get(model);
           if (!active || !m) return query(args);
 
-          let tenantP: Promise<string> | undefined;
-          const resolveTenant = () =>
-            (tenantP ??= (async () => {
-              const t = (o.tenant ? await o.tenant({ model, operation, args }) : undefined) ?? currentTenant();
-              if (!t) {
-                throw new CryplusPrismaError(
-                  `no tenant for ${model}.${operation}; wrap the call in withTenant("<id>", …) or pass a tenant resolver`,
-                );
-              }
-              return t;
-            })());
+          const tenants = new Map<string, Promise<string>>();
+          const resolveTenant = (forModel: string) => {
+            let p = tenants.get(forModel);
+            if (!p) {
+              p = (async () => {
+                const t = (o.tenant ? await o.tenant({ model: forModel, operation, args }) : undefined) ?? currentTenant();
+                if (!t) {
+                  throw new CryplusPrismaError(
+                    `no tenant for ${forModel} (${model}.${operation}); wrap the call in withTenant("<id>", …) or pass a tenant resolver`,
+                  );
+                }
+                return t;
+              })();
+              tenants.set(forModel, p);
+            }
+            return p;
+          };
           const x = new Transformer(o.cryplus, schema, resolveTenant, topts);
 
           const a: any = { ...(args ?? {}) };

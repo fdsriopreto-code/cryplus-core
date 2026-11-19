@@ -39,7 +39,8 @@ Postgres / S3   ← only ciphertext ever lands here
 | [`core/`](core) | `cryplus-core`: Go library + sidecar binary (envelope, streams, keyring, HTTP API, audit) |
 | [`sdk/node/`](sdk/node) | Node/TypeScript SDK **+ Prisma extension**, migration helper, encrypted-S3 helper |
 | [`sdk/python/`](sdk/python) | Python SDK (stdlib only) |
-| [`examples/prisma-demo/`](examples/prisma-demo) | End-to-end tests: real Prisma + real Postgres |
+| [`examples/prisma-demo/`](examples/prisma-demo) | End-to-end tests: Prisma 7 + real Postgres (TypeScript, ESM) |
+| [`examples/prisma5-cjs/`](examples/prisma5-cjs) | End-to-end tests: Prisma 5.22 + plain JavaScript/CommonJS (no driver adapter) |
 | [`examples/s3-demo/`](examples/s3-demo) | End-to-end tests: AWS SDK v3 (incl. multipart) + S3-compatible server |
 | [`tools/fakes3/`](tools/fakes3) | Tiny S3 emulator used by the tests (not AWS) |
 
@@ -88,6 +89,20 @@ Go users can skip the sidecar and import `github.com/fdsriopreto-code/cryplus-co
    ```
 
 Your code reads and writes plain values; Postgres only ever stores `cp1.…` ciphertext.
+
+### Tenant resolution
+
+The tenant is taken from `withTenant()` (AsyncLocalStorage), or from the `tenant` option, which is
+called **per model** (so nested writes and included relations each resolve their own). Platform tables
+that exist before any tenant (signup, login) can use a fixed scope:
+
+```ts
+withCryplus(client, { cryplus, schemaPath,
+  tenant: ({ model }) => (model === "Tenant" ? "__platform__" : undefined) });  // undefined = ambient tenant
+```
+
+If no tenant can be resolved the operation fails closed. Background jobs and webhooks must wrap their
+work in `withTenant(id, …)`; jobs that sweep all tenants loop tenant by tenant.
 
 ### What the extension handles
 
@@ -161,7 +176,7 @@ Any language can call the HTTP API (see [`core/server`](core/server/server.go)):
 - The sidecar speaks plain HTTP on loopback and refuses other addresses unless `--allow-remote`.
   There is no built-in TLS/mTLS yet; put a TLS terminator in front if you must go off-host.
 - No rate limiting. A transparent Postgres wire-protocol proxy is **not** implemented (see below).
-- Tested with Prisma 7.10.1, Node 24, Go 1.27, PostgreSQL 18.
+- Tested with Prisma 7.10.1 (ESM/TS) and 5.22.0 (CommonJS/JS), Node 24, Go 1.27, PostgreSQL 18. The SDK ships both ESM and CJS builds.
 
 ## Roadmap
 

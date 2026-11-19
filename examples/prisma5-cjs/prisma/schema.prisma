@@ -1,0 +1,72 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Platform-level table: its secrets are encrypted under the fixed "__platform__" tenant,
+// because the tenant row is created/read before any tenant context exists (signup, login).
+model Tenant {
+  id                  String        @id @default(uuid())
+  nome                String
+  /// @encrypted
+  mpOauthAccessToken  String?
+  /// @encrypted
+  mpOauthRefreshToken String?
+  funcionarios        Funcionario[]
+  configuracoes       Configuracao[]
+  conversas           Conversa[]
+}
+
+model Funcionario {
+  id          String  @id @default(uuid())
+  tenantId    String
+  nome        String
+  /// @encrypted(searchable, digits)
+  cpf         String?
+  cpfIdx      String?
+  /// @encrypted
+  rg          String?
+  tenant      Tenant  @relation(fields: [tenantId], references: [id])
+
+  // uniqueness must live on the blind index, not on the ciphertext
+  @@unique([tenantId, cpfIdx])
+}
+
+// Generic key/value table. Sensitive values go in valorSecreto, so non-sensitive keys
+// (and phone lookups done in raw SQL) keep using `valor`.
+model Configuracao {
+  id            String @id @default(uuid())
+  tenantId      String
+  chave         String
+  valor         String?
+  /// @encrypted
+  valorSecreto  String?
+  tenant        Tenant @relation(fields: [tenantId], references: [id])
+
+  @@unique([tenantId, chave])
+}
+
+model Conversa {
+  id        String     @id @default(uuid())
+  tenantId  String
+  tenant    Tenant     @relation(fields: [tenantId], references: [id])
+  mensagens Mensagem[]
+}
+
+// No tenantId column: the tenant comes from the request context, not from the row.
+model Mensagem {
+  id         String   @id @default(uuid())
+  conversaId String
+  direcao    String
+  /// @encrypted
+  conteudo   String?
+  linkHash   String?
+  createdAt  DateTime @default(now())
+  conversa   Conversa @relation(fields: [conversaId], references: [id])
+
+  @@index([conversaId, linkHash])
+}

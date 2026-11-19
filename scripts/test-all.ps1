@@ -28,7 +28,9 @@ if ($E2E) {
   Write-Host "== E2E: S3 ==" -ForegroundColor Cyan
   Push-Location "$root\tools\fakes3"; go build -o "$root\bin\fakes3.exe" .; Pop-Location
   Push-Location "$root\examples\s3-demo"; node --test --test-concurrency=1 s3.test.ts; if ($LASTEXITCODE) { exit 1 }; Pop-Location
-  Write-Host "== E2E: Prisma + Postgres ==" -ForegroundColor Cyan
+  Write-Host "== E2E: Prisma 5.22 + CommonJS ==" -ForegroundColor Cyan
+  Push-Location "$root\examples\prisma5-cjs"; node --test --test-concurrency=1 e2e.test.js; if ($LASTEXITCODE) { exit 1 }; Pop-Location
+  Write-Host "== E2E: Prisma 7 + Postgres ==" -ForegroundColor Cyan
   Push-Location "$root\examples\prisma-demo"; npx tsx --test --test-concurrency=1 e2e.test.ts; if ($LASTEXITCODE) { exit 1 }; Pop-Location
 }
 Write-Host "ALL GREEN" -ForegroundColor Green
