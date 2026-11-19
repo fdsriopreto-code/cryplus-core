@@ -17,6 +17,10 @@ import { Cryplus, EncryptedS3 } from "cryplus";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const BIN = path.resolve(here, "../../bin");
 const TOKEN = "s3-token-0123456789abcdef";
+// S3_SERVER=gostore runs the suite against gostore-s3 (real SigV4 server) instead of the emulator.
+const USE_GOSTORE = process.env.S3_SERVER === "gostore";
+const S3_KEY = USE_GOSTORE ? "testadmin" : "test";
+const S3_SECRET = USE_GOSTORE ? "testsecret-123456" : "test";
 
 const freePort = () =>
   new Promise<number>((res) => {
@@ -60,7 +64,12 @@ before(async () => {
       env: { ...process.env, CRYPLUS_TOKEN: TOKEN },
       stdio: "ignore",
     }),
-    spawn(path.join(BIN, "fakes3.exe"), ["--listen", `127.0.0.1:${s3Port}`], { stdio: "ignore" }),
+    USE_GOSTORE
+      ? spawn(path.join(BIN, "gostore.exe"), ["server", path.join(tmp, "gostore-data")], {
+          env: { ...process.env, GOSTORE_ROOT_USER: S3_KEY, GOSTORE_ROOT_PASSWORD: S3_SECRET, GOSTORE_ADDRESS: `127.0.0.1:${s3Port}` },
+          stdio: "ignore",
+        })
+      : spawn(path.join(BIN, "fakes3.exe"), ["--listen", `127.0.0.1:${s3Port}`], { stdio: "ignore" }),
   );
   await waitFor(`http://127.0.0.1:${corePort}/healthz`);
   await waitFor(`http://127.0.0.1:${s3Port}/`);
@@ -68,7 +77,7 @@ before(async () => {
     endpoint: `http://127.0.0.1:${s3Port}`,
     region: "us-east-1",
     forcePathStyle: true,
-    credentials: { accessKeyId: "test", secretAccessKey: "test" },
+    credentials: { accessKeyId: S3_KEY, secretAccessKey: S3_SECRET },
   });
   await s3.send(new CreateBucketCommand({ Bucket: BUCKET }));
   cp = new Cryplus({ url: `http://127.0.0.1:${corePort}`, token: TOKEN });

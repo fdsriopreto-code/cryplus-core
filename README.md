@@ -119,6 +119,11 @@ await s3.put(tenantId, "bucket", "docs/contract.pdf", fileStream);   // encrypte
 const plain = await s3.get(tenantId, "bucket", "docs/contract.pdf"); // Readable; errors on tamper/truncation
 ```
 
+Verified against the AWS SDK v3 (including lib-storage multipart) on two S3-compatible servers: the
+bundled emulator and [gostore-s3](https://github.com/fdsriopreto-code/gostore-s3)
+(`S3_SERVER=gostore node --test examples/s3-demo/s3.test.ts`). It has **not** been run against AWS S3 itself.
+Cryplus encrypts on the client, so it composes with any server-side encryption the storage already has.
+
 ## Other languages
 
 Any language can call the HTTP API (see [`core/server`](core/server/server.go)): `POST /v1/encrypt`,
