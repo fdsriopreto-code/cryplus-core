@@ -1,0 +1,24 @@
+{
+  "name": "cryplus",
+  "version": "0.1.0",
+  "description": "Cryplus SDK: field-level, per-record envelope encryption via cryplus-core, with a Prisma extension.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": { "node": ">=20" },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
+    "./prisma": { "types": "./dist/prisma.d.ts", "default": "./dist/prisma.js" }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-test-isolation=none test/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "~5.9.0"
+  }
+}

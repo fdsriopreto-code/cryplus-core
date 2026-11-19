@@ -1,0 +1,23 @@
+{
+  "name": "cryplus-prisma-demo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate": "prisma generate",
+    "pg": "node pg.ts",
+    "e2e": "node e2e.ts"
+  },
+  "dependencies": {
+    "@prisma/adapter-pg": "7.10.1",
+    "@prisma/client": "7.10.1",
+    "cryplus": "file:../../sdk/node",
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.11.0",
+    "embedded-postgres": "18.7.0-beta.19",
+    "prisma": "7.10.1",
+    "typescript": "~5.9.0"
+  }
+}

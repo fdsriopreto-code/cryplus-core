@@ -1,0 +1,20 @@
+# build outputs
+bin/
+dist/
+node_modules/
+generated/
+*.exe
+
+# local test infrastructure (databases, downloaded servers, logs)
+.pgdata/
+.tools/
+.pg.log
+
+# secrets and runtime state: NEVER commit
+cryplus-keys*.json
+cryplus-audit*.jsonl
+*.sealed
+.env
+.env.*
+__pycache__/
+*.pyc
