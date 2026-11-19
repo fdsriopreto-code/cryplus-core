@@ -1,16 +1,18 @@
 import { readFileSync } from "node:fs";
-import type { Cryplus } from "./client.ts";
-import {
-  hasEncryptedFields,
-  normalizeValue,
-  parseSchema,
-  type EncryptedField,
-  type ModelInfo,
-  type Schema,
-} from "./schema.ts";
+import { applyNormalizers, hasEncryptedFields, parseSchema, type EncryptedField, type ModelInfo, type Schema } from "./schema.ts";
 import { currentTenant } from "./tenant.ts";
+import { createRawHelpers, rawGuardHooks, type RawGuardMode } from "./raw.ts";
+import type { MetricsSink } from "./metrics.ts";
 
-type CryptoLike = Pick<Cryplus, "encrypt" | "decrypt" | "blindIndex">;
+/** The part of the client the extension needs (satisfied by Cryplus and by the in-memory client). */
+export interface CryptoLike {
+  encrypt(ctx: { tenant: string; collection?: string; field?: string; recordId?: string }, plaintext: string | Uint8Array): Promise<string>;
+  decrypt(ctx: { tenant: string; collection?: string; field?: string; recordId?: string }, ciphertext: string): Promise<string>;
+  blindIndex(ctx: { tenant: string; collection?: string; field?: string; recordId?: string }, value: string): Promise<string>;
+}
+
+/** Tenant used for platform-scoped (`@encrypted(global)`) blind indexes. */
+export const GLOBAL_TENANT = "__global__";
 
 export interface PrismaOptions {
   cryplus: CryptoLike;
@@ -33,8 +35,16 @@ export interface PrismaOptions {
    * working; use "reject" once migration is done so plaintext can't hide.
    */
   plaintext?: "allow" | "reject";
-  /** Remove `<field>Idx` blind-index columns from results (default true). */
+  /** Remove companion index columns from results (default true). */
   hideIndexFields?: boolean;
+  /**
+   * What to do when a raw query ($queryRaw / $executeRaw, tagged or Unsafe) mentions an encrypted column
+   * of an encrypted table: "throw" (default) refuses it, "warn" logs, "off" ignores. Mark a reviewed query
+   * as handled by putting the comment marker `/* cryplus:handled *\/` inside the SQL text.
+   */
+  rawGuard?: RawGuardMode;
+  /** Receives `prisma_errors_total{code,model,operation}` with code no_tenant | decryption_failed | raw_blocked | unsupported_query | plaintext_rejected | other. */
+  metrics?: MetricsSink;
 }
 
 const CT_PREFIX = "cp1.";
@@ -56,40 +66,99 @@ const isPlainObject = (v: unknown): v is Record<string, any> => {
 const maybeArray = async <T>(v: T | T[], fn: (e: T) => Promise<T>): Promise<T | T[]> =>
   Array.isArray(v) ? Promise.all(v.map(fn)) : fn(v);
 
+export interface TransformerOptions {
+  plaintext: "allow" | "reject";
+  hideIndexFields: boolean;
+}
+
 export class Transformer {
   readonly c: CryptoLike;
   readonly schema: Schema;
   private resolveTenant: (model: string) => Promise<string>;
-  readonly opts: { plaintext: "allow" | "reject"; hideIndexFields: boolean };
+  readonly opts: TransformerOptions;
 
-  constructor(
-    c: CryptoLike,
-    schema: Schema,
-    resolveTenant: (model: string) => Promise<string>,
-    opts: { plaintext: "allow" | "reject"; hideIndexFields: boolean },
-  ) {
+  constructor(c: CryptoLike, schema: Schema, resolveTenant: (model: string) => Promise<string>, opts: TransformerOptions) {
     this.c = c;
     this.schema = schema;
     this.resolveTenant = resolveTenant;
     this.opts = opts;
   }
 
-  private model(name: string): ModelInfo {
+  model(name: string): ModelInfo {
     const m = this.schema.get(name);
     if (!m) throw new CryplusPrismaError(`unknown model ${name}`);
     return m;
   }
 
-  private async ctx(model: string, field: string) {
+  // ---- primitives (also used by the raw-SQL helpers) --------------------------
+
+  async ctx(model: string, field: string) {
     return { tenant: await this.resolveTenant(model), collection: model, field };
   }
 
-  async encryptValue(model: ModelInfo, enc: EncryptedField, plain: string) {
+  async encryptScalar(model: ModelInfo, enc: EncryptedField, plain: string) {
     return this.c.encrypt(await this.ctx(model.name, enc.name), plain);
   }
 
-  async indexValue(model: ModelInfo, enc: EncryptedField, plain: string) {
-    return this.c.blindIndex(await this.ctx(model.name, enc.name), normalizeValue(plain, enc.normalize));
+  async decryptScalar(model: ModelInfo, enc: EncryptedField, ct: string) {
+    return this.c.decrypt(await this.ctx(model.name, enc.name), ct);
+  }
+
+  /** Blind-index value under one scope. `scope` selects the key domain: per-tenant equality, global, or suffix(n). */
+  async indexOf(model: ModelInfo, enc: EncryptedField, plain: string, scope: "tenant" | "global" | { suffix: number }) {
+    const norm = applyNormalizers(plain, enc.normalize);
+    if (scope === "global") return this.c.blindIndex({ tenant: GLOBAL_TENANT, collection: model.name, field: enc.name + "#g" }, norm);
+    if (scope === "tenant") return this.c.blindIndex(await this.ctx(model.name, enc.name), norm);
+    if (norm.length < scope.suffix) return null;
+    return this.c.blindIndex(await this.ctx(model.name, `${enc.name}#sfx${scope.suffix}`), norm.slice(-scope.suffix));
+  }
+
+  /** All companion index values for a plaintext, keyed by column name. */
+  async indexesFor(model: ModelInfo, enc: EncryptedField, plain: string | null): Promise<Record<string, string | null>> {
+    const out: Record<string, string | null> = {};
+    if (enc.indexField) out[enc.indexField] = plain === null ? null : await this.indexOf(model, enc, plain, "tenant");
+    if (enc.globalIndexField) out[enc.globalIndexField] = plain === null ? null : await this.indexOf(model, enc, plain, "global");
+    for (const s of enc.suffixes) out[s.field] = plain === null ? null : await this.indexOf(model, enc, plain, { suffix: s.n });
+    return out;
+  }
+
+  /** App value -> stored value, for any supported kind. */
+  async encryptValue(model: ModelInfo, enc: EncryptedField, v: unknown): Promise<unknown> {
+    if (v === null || v === undefined) return v;
+    const where = `${model.name}.${enc.name}`;
+    if (enc.kind === "string") {
+      if (typeof v !== "string") throw new CryplusPrismaError(`${where} is @encrypted and only accepts string values`);
+      if (isCiphertext(v)) throw new CryplusPrismaError(`${where}: refusing to store a value that already looks like ciphertext`);
+      return this.encryptScalar(model, enc, v);
+    }
+    if (enc.kind === "string[]") {
+      if (!Array.isArray(v) || v.some((e) => typeof e !== "string")) {
+        throw new CryplusPrismaError(`${where} is an encrypted String[] and only accepts arrays of strings`);
+      }
+      return Promise.all(v.map((e) => this.encryptScalar(model, enc, e)));
+    }
+    // json: stored as an encrypted JSON string
+    return this.encryptScalar(model, enc, JSON.stringify(v));
+  }
+
+  /** Stored value -> app value. Plaintext found where ciphertext is expected follows the `plaintext` policy. */
+  async decryptValue(model: ModelInfo, enc: EncryptedField, v: unknown): Promise<unknown> {
+    const where = `${model.name}.${enc.name}`;
+    const legacy = (x: unknown) => {
+      if (this.opts.plaintext === "reject") throw new CryplusPrismaError(`${where} holds a plaintext value but plaintext reads are rejected`);
+      return x;
+    };
+    if (v === null || v === undefined) return v;
+    if (enc.kind === "string") {
+      if (typeof v !== "string") return v;
+      return isCiphertext(v) ? this.decryptScalar(model, enc, v) : legacy(v);
+    }
+    if (enc.kind === "string[]") {
+      if (!Array.isArray(v)) return v;
+      return Promise.all(v.map((e) => (isCiphertext(e) ? this.decryptScalar(model, enc, e) : legacy(e))));
+    }
+    if (isCiphertext(v)) return JSON.parse(await this.decryptScalar(model, enc, v));
+    return legacy(v);
   }
 
   // ---- writes --------------------------------------------------------------
@@ -118,26 +187,48 @@ export class Transformer {
   }
 
   private async encryptField(model: ModelInfo, enc: EncryptedField, v: unknown, out: Record<string, any>) {
-    const wrapped = isPlainObject(v) && Object.keys(v).length === 1 && "set" in v;
-    const raw = wrapped ? (v as any).set : v;
-    if (raw === undefined) return;
-    if (raw === null) {
-      out[enc.name] = wrapped ? { set: null } : null;
-      if (enc.indexField) out[enc.indexField] = null;
+    if (v === undefined) return;
+    const where = `${model.name}.${enc.name}`;
+
+    if (enc.kind === "string") {
+      const wrapped = isPlainObject(v) && Object.keys(v).length === 1 && "set" in v;
+      const raw = wrapped ? (v as any).set : v;
+      if (raw === undefined) return;
+      if (raw === null) {
+        out[enc.name] = wrapped ? { set: null } : null;
+        Object.assign(out, await this.indexesFor(model, enc, null));
+        return;
+      }
+      const [ct, idx] = await Promise.all([this.encryptValue(model, enc, raw), this.indexesFor(model, enc, raw as string)]);
+      out[enc.name] = wrapped ? { set: ct } : ct;
+      Object.assign(out, idx);
       return;
     }
-    if (typeof raw !== "string") {
-      throw new CryplusPrismaError(`${model.name}.${enc.name} is @encrypted and only accepts string values`);
+
+    if (enc.kind === "string[]") {
+      if (v === null) {
+        out[enc.name] = null;
+      } else if (Array.isArray(v)) {
+        out[enc.name] = await this.encryptValue(model, enc, v);
+      } else if (isPlainObject(v) && Object.keys(v).length === 1 && "set" in v) {
+        out[enc.name] = { set: await this.encryptValue(model, enc, (v as any).set) };
+      } else if (isPlainObject(v) && Object.keys(v).length === 1 && "push" in v) {
+        const p = (v as any).push;
+        out[enc.name] = { push: await this.encryptValue(model, enc, Array.isArray(p) ? p : [p]) };
+      } else {
+        throw new CryplusPrismaError(`${where}: unsupported write for an encrypted String[] (use an array, { set } or { push })`);
+      }
+      return;
     }
-    if (isCiphertext(raw)) {
-      throw new CryplusPrismaError(`${model.name}.${enc.name}: refusing to store a value that already looks like ciphertext`);
+
+    // json
+    if (v === null) {
+      out[enc.name] = null;
+    } else if (typeof v === "object" && !Array.isArray(v) && !isPlainObject(v)) {
+      out[enc.name] = v; // Prisma.JsonNull / DbNull and other sentinels pass through untouched
+    } else {
+      out[enc.name] = await this.encryptValue(model, enc, v);
     }
-    const [ct, idx] = await Promise.all([
-      this.encryptValue(model, enc, raw),
-      enc.indexField ? this.indexValue(model, enc, raw) : Promise.resolve(undefined),
-    ]);
-    out[enc.name] = wrapped ? { set: ct } : ct;
-    if (enc.indexField) out[enc.indexField] = idx;
   }
 
   private async nested(target: ModelInfo, v: Record<string, any>): Promise<Record<string, any>> {
@@ -216,6 +307,18 @@ export class Transformer {
         Object.assign(out, await this.encCondition(model, enc, v));
         continue;
       }
+      // compound unique key (findUnique / upsert / update by `tenantId_cpf`) whose uniqueness lives on the blind index
+      const cu = model.compound.get(k);
+      if (cu && isPlainObject(v)) {
+        const inner: Record<string, any> = {};
+        for (const [f, val] of Object.entries(v)) {
+          const e = model.encrypted.get(f);
+          if (e) Object.assign(inner, await this.encCondition(model, e, val));
+          else inner[f] = val;
+        }
+        out[cu.realKey] = inner;
+        continue;
+      }
       const rel = model.fields.get(k)?.relation;
       if (rel && isPlainObject(v)) {
         const target = this.model(rel);
@@ -236,32 +339,56 @@ export class Transformer {
   }
 
   private async encCondition(model: ModelInfo, enc: EncryptedField, v: any): Promise<Record<string, any>> {
+    const where = `${model.name}.${enc.name}`;
     if (v === null) return { [enc.name]: null };
-    if (!enc.searchable || !enc.indexField) {
+    if (enc.kind !== "string") {
+      if (enc.kind === "string[]" && isPlainObject(v) && Object.keys(v).length === 1 && "isEmpty" in v) return { [enc.name]: v };
+      throw new CryplusPrismaError(`cannot filter on encrypted ${enc.kind} field ${where}`);
+    }
+
+    // suffix match: { endsWith: "..." }
+    if (isPlainObject(v) && Object.keys(v).length === 1 && "endsWith" in v) {
+      if (enc.suffixes.length === 0) {
+        throw new CryplusPrismaError(`cannot use endsWith on encrypted field ${where}; add suffix(n) to its @encrypted(...) options`);
+      }
+      if (typeof v.endsWith !== "string") throw new CryplusPrismaError(`${where}: endsWith needs a string`);
+      const norm = applyNormalizers(v.endsWith, enc.normalize);
+      const s = enc.suffixes.find((x) => x.n === norm.length);
+      if (!s) {
+        throw new CryplusPrismaError(
+          `${where}: endsWith values must have exactly one of the indexed lengths [${enc.suffixes.map((x) => x.n).join(", ")}] after normalization (got ${norm.length})`,
+        );
+      }
+      return { [s.field]: await this.indexOf(model, enc, v.endsWith, { suffix: s.n }) };
+    }
+
+    const scope: "tenant" | "global" | null = enc.indexField ? "tenant" : enc.globalIndexField ? "global" : null;
+    const col = scope === "tenant" ? enc.indexField! : scope === "global" ? enc.globalIndexField! : null;
+    if (!scope || !col) {
       throw new CryplusPrismaError(
-        `cannot filter on encrypted field ${model.name}.${enc.name}; mark it @encrypted(searchable) for equality search`,
+        `cannot filter on encrypted field ${where}; mark it @encrypted(searchable) for equality search`,
       );
     }
     const bi = (s: unknown) => {
-      if (typeof s !== "string") throw new CryplusPrismaError(`${model.name}.${enc.name}: filter values must be strings`);
-      return this.indexValue(model, enc, s);
+      if (typeof s !== "string") throw new CryplusPrismaError(`${where}: filter values must be strings`);
+      return this.indexOf(model, enc, s, scope);
     };
     const cond = async (x: any): Promise<any> => {
       if (x === null) return null;
       if (typeof x === "string") return bi(x);
-      if (!isPlainObject(x)) throw new CryplusPrismaError(`${model.name}.${enc.name}: unsupported filter`);
+      if (!isPlainObject(x)) throw new CryplusPrismaError(`${where}: unsupported filter`);
       const o: Record<string, any> = {};
       for (const [op, val] of Object.entries(x)) {
         if (op === "equals" || op === "not") o[op] = await cond(val);
         else if (op === "in" || op === "notIn") o[op] = await Promise.all((val as unknown[]).map(bi));
         else
           throw new CryplusPrismaError(
-            `operator "${op}" is not supported on encrypted field ${model.name}.${enc.name} (only equals, in, not, notIn)`,
+            `operator "${op}" is not supported on encrypted field ${where} (only equals, in, not, notIn${enc.suffixes.length ? ", endsWith" : ""})`,
           );
       }
       return o;
     };
-    return { [enc.indexField]: await cond(v) };
+    return { [col]: await cond(v) };
   }
 
   /** Walk select/include so filters inside nested relations are rewritten too. */
@@ -298,6 +425,20 @@ export class Transformer {
     }
   }
 
+  /** aggregate / groupBy must not compute over ciphertext. */
+  checkAggregate(model: ModelInfo, operation: string, a: any) {
+    const bad = (f: string) => {
+      throw new CryplusPrismaError(`cannot ${operation} on encrypted field ${model.name}.${f}`);
+    };
+    for (const key of ["_min", "_max", "_sum", "_avg"]) {
+      if (isPlainObject(a[key])) for (const f of Object.keys(a[key])) if (model.encrypted.has(f)) bad(f);
+    }
+    if (operation === "groupBy") {
+      for (const f of [a.by].flat()) if (typeof f === "string" && model.encrypted.has(f)) bad(f);
+      if (isPlainObject(a.having)) for (const f of Object.keys(a.having)) if (model.encrypted.has(f)) bad(f);
+    }
+  }
+
   // ---- reads ---------------------------------------------------------------
 
   async result(model: ModelInfo, value: any): Promise<any> {
@@ -311,14 +452,7 @@ export class Transformer {
       const v = value[k];
       const enc = model.encrypted.get(k);
       if (enc) {
-        if (typeof v !== "string") continue;
-        if (isCiphertext(v)) {
-          tasks.push(
-            this.ctx(model.name, k).then((cx) => this.c.decrypt(cx, v)).then((p) => void (value[k] = p)),
-          );
-        } else if (this.opts.plaintext === "reject") {
-          throw new CryplusPrismaError(`${model.name}.${k} holds a plaintext value but plaintext reads are rejected`);
-        }
+        tasks.push(this.decryptValue(model, enc, v).then((p) => void (value[k] = p)));
       } else if (this.opts.hideIndexFields && model.indexFields.has(k)) {
         delete value[k];
       } else {
@@ -331,6 +465,20 @@ export class Transformer {
   }
 }
 
+/** Shared by the query hooks and the raw-SQL helpers. */
+export function makeTenantResolver(o: PrismaOptions) {
+  return (forModel: string, operation = "raw", args: any = undefined): Promise<string> =>
+    (async () => {
+      const t = (o.tenant ? await o.tenant({ model: forModel, operation, args }) : undefined) ?? currentTenant();
+      if (!t) {
+        throw new CryplusPrismaError(
+          `no tenant for ${forModel} (${operation}); wrap the call in withTenant("<id>", …) or pass a tenant resolver`,
+        );
+      }
+      return t;
+    })();
+}
+
 const NO_RESULT_DECRYPT = new Set(["count", "aggregate", "groupBy"]);
 
 /** Build the Prisma Client extension definition (use with client.$extends). */
@@ -339,11 +487,15 @@ export function cryplusExtension(o: PrismaOptions) {
   if (!text) throw new CryplusPrismaError("provide schemaPath or schemaText");
   const schema = parseSchema(text);
   const active = hasEncryptedFields(schema);
-  const topts = { plaintext: o.plaintext ?? "allow", hideIndexFields: o.hideIndexFields ?? true } as const;
+  const topts: TransformerOptions = { plaintext: o.plaintext ?? "allow", hideIndexFields: o.hideIndexFields ?? true };
+  const resolver = makeTenantResolver(o);
+  const helpers = createRawHelpers(o.cryplus, schema, (m) => resolver(m), topts);
 
-  return {
+  const ext = {
     name: "cryplus",
+    client: { $cryplus: helpers },
     query: {
+      ...(active ? rawGuardHooks(schema, o.rawGuard ?? "throw") : {}),
       $allModels: {
         async $allOperations({ model, operation, args, query }: { model: string; operation: string; args: any; query: (a: any) => Promise<any> }) {
           const m = schema.get(model);
@@ -353,15 +505,7 @@ export function cryplusExtension(o: PrismaOptions) {
           const resolveTenant = (forModel: string) => {
             let p = tenants.get(forModel);
             if (!p) {
-              p = (async () => {
-                const t = (o.tenant ? await o.tenant({ model: forModel, operation, args }) : undefined) ?? currentTenant();
-                if (!t) {
-                  throw new CryplusPrismaError(
-                    `no tenant for ${forModel} (${model}.${operation}); wrap the call in withTenant("<id>", …) or pass a tenant resolver`,
-                  );
-                }
-                return t;
-              })();
+              p = resolver(forModel, `${model}.${operation}`, args);
               tenants.set(forModel, p);
             }
             return p;
@@ -372,13 +516,7 @@ export function cryplusExtension(o: PrismaOptions) {
           if (a.where) a.where = await x.where(m, a.where);
           if (a.cursor) a.cursor = await x.where(m, a.cursor);
           x.checkOrder(m, a.orderBy);
-          if (operation === "groupBy") {
-            for (const f of [a.by].flat()) {
-              if (typeof f === "string" && m.encrypted.has(f)) {
-                throw new CryplusPrismaError(`cannot groupBy encrypted field ${model}.${f}`);
-              }
-            }
-          }
+          if (operation === "aggregate" || operation === "groupBy") x.checkAggregate(m, operation, a);
           if (Array.isArray(a.distinct) ? a.distinct.some((f: string) => m.encrypted.has(f)) : m.encrypted.has(a.distinct)) {
             throw new CryplusPrismaError(`cannot use distinct on an encrypted field of ${model}`);
           }
@@ -407,6 +545,33 @@ export function cryplusExtension(o: PrismaOptions) {
       },
     },
   };
+
+  // Metrics: count what goes wrong, by cause, so a dashboard can alert on "no tenant" or "decryption_failed" bursts.
+  if (o.metrics) {
+    const sink = o.metrics;
+    const inner = ext.query.$allModels.$allOperations;
+    ext.query.$allModels.$allOperations = async (p: any) => {
+      try {
+        return await inner(p);
+      } catch (e) {
+        const m = e instanceof Error ? e.message : String(e);
+        const code = /no tenant/.test(m)
+          ? "no_tenant"
+          : /decryption_failed/.test(m)
+            ? "decryption_failed"
+            : /raw SQL touches/.test(m)
+              ? "raw_blocked"
+              : /cannot|not supported|searchable|indexed lengths/.test(m)
+                ? "unsupported_query"
+                : /plaintext reads are rejected/.test(m)
+                  ? "plaintext_rejected"
+                  : "other";
+        sink.inc("prisma_errors_total", { code, model: p?.model ?? "", operation: p?.operation ?? "" });
+        throw e;
+      }
+    };
+  }
+  return ext;
 }
 
 /** Convenience: `const prisma = withCryplus(new PrismaClient(...), { cryplus, schemaPath })`. */

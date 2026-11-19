@@ -124,19 +124,24 @@ func (p providerFlags) build(ctx context.Context) (keyring.Provider, error) {
 
 func serve() {
 	var (
-		listen   = flag.String("listen", "127.0.0.1:7788", "address to listen on")
-		remote   = flag.Bool("allow-remote", false, "allow a non-loopback address (REQUIRES --tls-cert/--tls-key)")
-		provider = flag.String("provider", "local", "key provider: local | vault | kms | memory")
-		keyfile  = flag.String("keyfile", "", "key file path (default ./cryplus-keys.json)")
-		follower = flag.Bool("follower", false, "read-only instance: never creates or rotates keys, follows the leader's key file")
-		reload   = flag.Duration("reload-interval", 5*time.Second, "how often to re-read the key file and tokens file")
-		auditf   = flag.String("audit-log", "cryplus-audit.jsonl", "audit log path ('-' for stderr, '' to disable)")
-		alg      = flag.String("alg", "xchacha20", "payload cipher: xchacha20 | aes256gcm")
-		dev      = flag.Bool("dev", false, "generate an ephemeral token and print it")
-		tokens   = flag.String("tokens-file", "", "per-service tokens file (see 'token new'); otherwise CRYPLUS_TOKEN is used")
-		tlsCert  = flag.String("tls-cert", "", "TLS certificate (PEM); enables HTTPS (TLS 1.3 only)")
-		tlsKey   = flag.String("tls-key", "", "TLS private key (PEM)")
-		clientCA = flag.String("client-ca", "", "CA bundle (PEM): require and verify client certificates (mutual TLS)")
+		listen    = flag.String("listen", "127.0.0.1:7788", "address to listen on")
+		remote    = flag.Bool("allow-remote", false, "allow a non-loopback address (REQUIRES --tls-cert/--tls-key)")
+		provider  = flag.String("provider", "local", "key provider: local | vault | kms | memory")
+		keyfile   = flag.String("keyfile", "", "key file path (default ./cryplus-keys.json)")
+		follower  = flag.Bool("follower", false, "read-only instance: never creates or rotates keys, follows the leader's key file")
+		reload    = flag.Duration("reload-interval", 5*time.Second, "how often to re-read the key file and tokens file")
+		auditf    = flag.String("audit-log", "cryplus-audit.jsonl", "audit log path ('-' for stderr, '' to disable)")
+		auditLvl  = flag.String("audit-level", "all", "all | denied (only failures and administrative events: rotation, key export)")
+		auditN    = flag.Uint64("audit-sample", 0, "log only 1 in N successful data operations (failures and administrative events are never sampled)")
+		auditMB   = flag.Int64("audit-max-mb", 0, "rotate the audit log file at this size in MiB (0 = never)")
+		auditKeep = flag.Int("audit-keep", 5, "rotated audit files to keep")
+		alg       = flag.String("alg", "xchacha20", "payload cipher: xchacha20 | aes256gcm")
+		dev       = flag.Bool("dev", false, "generate an ephemeral token and print it")
+		tokens    = flag.String("tokens-file", "", "per-service tokens file (see 'token new'); otherwise CRYPLUS_TOKEN is used")
+		tlsCert   = flag.String("tls-cert", "", "TLS certificate (PEM); enables HTTPS (TLS 1.3 only)")
+		tlsKey    = flag.String("tls-key", "", "TLS private key (PEM)")
+		keyExport = flag.Bool("allow-key-export", false, "let services with the 'keys' role fetch tenant keys to cache them client-side (local crypto, offline cache). Off by default: it puts tenant keys in client memory")
+		clientCA  = flag.String("client-ca", "", "CA bundle (PEM): require and verify client certificates (mutual TLS)")
 	)
 	flag.Usage = usage
 	flag.Parse()
@@ -201,12 +206,24 @@ func serve() {
 	case "-":
 		aw = os.Stderr
 	default:
-		f, err := os.OpenFile(*auditf, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-		if err != nil {
-			log.Fatalf("audit log: %v", err)
+		if *auditMB > 0 {
+			f, err := audit.OpenRotating(*auditf, *auditMB<<20, *auditKeep)
+			if err != nil {
+				log.Fatalf("audit log: %v", err)
+			}
+			defer f.Close()
+			aw = f
+		} else {
+			f, err := os.OpenFile(*auditf, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+			if err != nil {
+				log.Fatalf("audit log: %v", err)
+			}
+			defer f.Close()
+			aw = f
 		}
-		defer f.Close()
-		aw = f
+	}
+	if *auditLvl != "all" && *auditLvl != "denied" {
+		log.Fatalf("unknown --audit-level %q", *auditLvl)
 	}
 
 	var opts server.ServeOptions
@@ -219,7 +236,11 @@ func serve() {
 		log.Fatal("--client-ca needs --tls-cert and --tls-key")
 	}
 
-	srv := server.NewWithAuth(envelope.New(p, a), audit.New(aw), auth)
+	srv := server.NewWithAuth(envelope.New(p, a), audit.NewWithOptions(aw, audit.Options{Level: *auditLvl, SampleEvery: *auditN}), auth)
+	if *keyExport {
+		srv.EnableKeyExport()
+		log.Println("WARNING: key export is ON: services with the 'keys' role receive tenant keys (see docs/DEPLOY.md)")
+	}
 	mode := "http"
 	if opts.TLS != nil {
 		mode = "https/TLS1.3"

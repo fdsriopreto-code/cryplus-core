@@ -586,3 +586,16 @@ func (l *Local) Status() []KeyVersion {
 	sort.Slice(out, func(i, j int) bool { return out[i].Version < out[j].Version })
 	return out
 }
+
+// ExportTenantKEK implements Exporter.
+func (l *Local) ExportTenantKEK(_ context.Context, version uint32, tenant string) ([]byte, uint32, error) {
+	if version == 0 {
+		version = l.CurrentVersion()
+	}
+	m, err := l.master(version)
+	if err != nil {
+		return nil, 0, err
+	}
+	k, err := tenantKEK(m, tenant)
+	return k, version, err
+}

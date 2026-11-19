@@ -19,3 +19,4 @@ cryplus-audit*.jsonl
 __pycache__/
 *.pyc
 *.log
+.pipeline.out

@@ -63,7 +63,7 @@ describe("schema parser", () => {
     assert.ok(u.indexFields.has("cpfIdx") && u.indexFields.has("phoneIdx"));
   });
   it("rejects misconfiguration loudly", () => {
-    assert.throws(() => parseSchema("model A {\n id Int @id\n n Int /// @encrypted\n}"), /not a plain String/);
+    assert.throws(() => parseSchema("model A {\n id Int @id\n n Int /// @encrypted\n}"), /does not support type Int/);
     assert.throws(() => parseSchema("model A {\n id Int @id\n n String /// @encrypted(searchable)\n}"), /nIdx/);
     assert.throws(() => parseSchema("model A {\n id Int @id\n n String /// @encrypted(bogus)\n}"), /unknown @encrypted option/);
     assert.throws(() => parseSchema("model A {\n id Int @id\n n String /// @encrypted(lowercase)\n}"), /only apply to searchable/);

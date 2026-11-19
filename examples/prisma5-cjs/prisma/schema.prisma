@@ -19,6 +19,7 @@ model Tenant {
   funcionarios        Funcionario[]
   configuracoes       Configuracao[]
   conversas           Conversa[]
+  clientes            Cliente[]
 }
 
 model Funcionario {
@@ -69,4 +70,52 @@ model Mensagem {
   conversa   Conversa @relation(fields: [conversaId], references: [id])
 
   @@index([conversaId, linkHash])
+}
+
+// Real database names via @map/@@map, searchable by suffix and globally, String[] and Json.
+model Cliente {
+  id           String      @id @default(uuid())
+  tenantId     String      @map("tenant_id")
+  nome         String
+  /// @encrypted(searchable, digits)
+  cpfCnpj      String?     @map("cpf_cnpj")
+  cpfCnpjIdx   String?     @map("cpf_cnpj_idx")
+  /// @encrypted(suffix(4), suffix(8), br-phone-canonical)
+  telefone     String?
+  telefoneSfx4 String?     @map("telefone_sfx4")
+  telefoneSfx8 String?     @map("telefone_sfx8")
+  /// @encrypted(global, email-lower)
+  email        String?
+  emailGIdx    String?     @map("email_gidx")
+  /// @encrypted
+  documentos   String[]
+  /// @encrypted
+  prefs        Json?
+  tenant       Tenant      @relation(fields: [tenantId], references: [id])
+  orcamentos   Orcamento[]
+
+  @@unique([tenantId, cpfCnpjIdx])
+  @@map("clientes")
+}
+
+model Orcamento {
+  id         String  @id @default(uuid())
+  tenantId   String  @map("tenant_id")
+  numero     Int
+  /// @encrypted
+  observacao String?
+  clienteId  String  @map("cliente_id")
+  cliente    Cliente @relation(fields: [clienteId], references: [id])
+
+  @@map("orcamentos")
+}
+
+model Webhook {
+  id       String  @id @default(uuid())
+  tenantId String  @map("tenant_id")
+  url      String
+  /// @encrypted
+  secret   String? @map("secret_value")
+
+  @@map("webhooks")
 }

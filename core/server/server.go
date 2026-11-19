@@ -33,6 +33,15 @@ type Server struct {
 	Audit *audit.Logger
 	Auth  *Auth
 	mux   *http.ServeMux
+
+	allowKeyExport bool
+}
+
+// EnableKeyExport turns on /v1/keys/tenant and /v1/keys/index. Off by default: handing a tenant key to a client
+// is a deliberate trade (local crypto and an offline cache, in exchange for the key living in that client's memory).
+func (s *Server) EnableKeyExport() *Server {
+	s.allowKeyExport = true
+	return s
 }
 
 // New builds a server with a single shared token (all roles, all tenants).
@@ -57,6 +66,8 @@ func NewWithAuth(svc *envelope.Service, a *audit.Logger, auth *Auth) *Server {
 	s.mux.HandleFunc("POST /v1/batch", s.guard(RoleCrypt, s.batch))
 	s.mux.HandleFunc("GET /v1/keys", s.guard(RoleAdmin, s.keys))
 	s.mux.HandleFunc("POST /v1/keys/rotate", s.guard(RoleAdmin, s.rotate))
+	s.mux.HandleFunc("POST /v1/keys/tenant", s.guard(RoleKeys, s.exportTenantKey))
+	s.mux.HandleFunc("POST /v1/keys/index", s.guard(RoleKeys, s.exportIndexKey))
 	s.mux.HandleFunc("POST /v1/stream/encrypt", s.guard(RoleCrypt, s.streamEncrypt))
 	s.mux.HandleFunc("POST /v1/stream/decrypt", s.guard(RoleCrypt, s.streamDecrypt))
 	s.mux.HandleFunc("POST /v1/stream/rewrap", s.guard(RoleCrypt, s.streamRewrap))
@@ -250,7 +261,7 @@ func (s *Server) single(op string) http.HandlerFunc {
 
 func statusFor(code string) int {
 	switch code {
-	case "decryption_failed", "tenant_forbidden", "role_forbidden":
+	case "decryption_failed", "tenant_forbidden", "role_forbidden", "key_export_disabled":
 		return 403
 	case "internal_error":
 		return 500
@@ -299,6 +310,79 @@ func (s *Server) rotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"version": v})
+}
+
+// exportTenantKey hands the caller the KEK of one tenant (current or a given version). Audited per fetch, never cached by proxies.
+func (s *Server) exportTenantKey(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Tenant  string `json:"tenant"`
+		Version uint32 `json:"version"`
+	}
+	if !readJSON(w, r, &in) {
+		return
+	}
+	svc := serviceOf(r)
+	deny := func(code string, status int) {
+		s.Audit.Log(audit.Event{Op: "key_export", Service: svcName(svc), Tenant: in.Tenant, KEKVersion: in.Version, OK: false, Code: code, Remote: remoteHost(r.RemoteAddr)})
+		writeErr(w, status, code)
+	}
+	exp, ok := s.Svc.Provider.(keyring.Exporter)
+	switch {
+	case !s.allowKeyExport || !ok:
+		deny("key_export_disabled", 403)
+		return
+	case in.Tenant == "":
+		deny("tenant_required", 400)
+		return
+	case !svc.AllowsTenant(in.Tenant):
+		deny("tenant_forbidden", 403)
+		return
+	}
+	key, used, err := exp.ExportTenantKEK(r.Context(), in.Version, in.Tenant)
+	if err != nil {
+		deny(errCode(err), statusFor(errCode(err)))
+		return
+	}
+	defer func() {
+		for i := range key {
+			key[i] = 0
+		}
+	}()
+	s.Audit.Log(audit.Event{Op: "key_export", Service: svcName(svc), Tenant: in.Tenant, KEKVersion: used, OK: true, Remote: remoteHost(r.RemoteAddr)})
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, 200, map[string]any{"version": used, "current": s.Svc.Provider.CurrentVersion(), "key": base64.StdEncoding.EncodeToString(key)})
+}
+
+// exportIndexKey hands out the HMAC key behind one blind index (tenant + collection + field), so the SDK can compute indexes locally.
+func (s *Server) exportIndexKey(w http.ResponseWriter, r *http.Request) {
+	var in envelope.Context
+	if !readJSON(w, r, &in) {
+		return
+	}
+	svc := serviceOf(r)
+	deny := func(code string, status int) {
+		s.Audit.Log(audit.Event{Op: "index_key_export", Service: svcName(svc), Tenant: in.Tenant, Collection: in.Collection, Field: in.Field, OK: false, Code: code, Remote: remoteHost(r.RemoteAddr)})
+		writeErr(w, status, code)
+	}
+	switch {
+	case !s.allowKeyExport:
+		deny("key_export_disabled", 403)
+		return
+	case in.Tenant == "":
+		deny("tenant_required", 400)
+		return
+	case !svc.AllowsTenant(in.Tenant):
+		deny("tenant_forbidden", 403)
+		return
+	}
+	key, err := s.Svc.Provider.IndexKey(r.Context(), in.Tenant, in.Collection+"\x00"+in.Field)
+	if err != nil {
+		deny(errCode(err), statusFor(errCode(err)))
+		return
+	}
+	s.Audit.Log(audit.Event{Op: "index_key_export", Service: svcName(svc), Tenant: in.Tenant, Collection: in.Collection, Field: in.Field, OK: true, Remote: remoteHost(r.RemoteAddr)})
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, 200, map[string]any{"key": base64.StdEncoding.EncodeToString(key)})
 }
 
 func streamCtx(r *http.Request) envelope.Context {

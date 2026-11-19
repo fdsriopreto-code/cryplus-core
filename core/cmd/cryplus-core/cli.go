@@ -50,7 +50,7 @@ func cmdToken(args []string) {
 	}
 	fs := flag.NewFlagSet("token new", flag.ExitOnError)
 	name := fs.String("name", "", "service name (shows up in the audit log)")
-	roles := fs.String("roles", "crypt", "comma-separated: crypt, admin")
+	roles := fs.String("roles", "crypt", "comma-separated: crypt, admin, keys")
 	tenants := fs.String("tenants", "", "comma-separated tenant allowlist: '*', exact ids, or 'prefix*' (required)")
 	file := fs.String("file", "", "tokens file to append to (created if missing)")
 	fs.Parse(args[1:])
@@ -63,6 +63,11 @@ func cmdToken(args []string) {
 	}
 	token := hex.EncodeToString(b)
 	r, t := splitList(*roles), splitList(*tenants)
+	for _, x := range r {
+		if x != server.RoleCrypt && x != server.RoleAdmin && x != server.RoleKeys {
+			log.Fatalf("unknown role %q (use crypt, admin, keys)", x)
+		}
+	}
 	if *file != "" {
 		if err := server.AppendService(*file, *name, token, r, t); err != nil {
 			log.Fatal(err)

@@ -1,6 +1,6 @@
 {
   "name": "cryplus",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Cryplus SDK: field-level, per-record envelope encryption via cryplus-core, with a Prisma extension.",
   "type": "module",
   "license": "Apache-2.0",
@@ -34,5 +34,8 @@
     "url": "git+https://github.com/fdsriopreto-code/cryplus-core.git",
     "directory": "sdk/node"
   },
-  "homepage": "https://github.com/fdsriopreto-code/cryplus-core#readme"
+  "homepage": "https://github.com/fdsriopreto-code/cryplus-core#readme",
+  "bin": {
+    "cryplus-scan": "./dist/cjs/scan-cli.js"
+  }
 }

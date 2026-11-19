@@ -1,5 +1,5 @@
 import { Readable } from "node:stream";
-import type { Cryplus } from "./client.ts";
+import type { CryplusApi } from "./client.ts";
 
 /** The pieces of @aws-sdk/client-s3 (and optionally lib-storage) this helper needs. */
 export interface S3Deps {
@@ -17,10 +17,10 @@ export interface S3Deps {
  * context, so an object copied or renamed to another key stops decrypting.
  */
 export class EncryptedS3 {
-  private cryplus: Cryplus;
+  private cryplus: CryplusApi;
   private s3: S3Deps;
 
-  constructor(cryplus: Cryplus, s3: S3Deps) {
+  constructor(cryplus: CryplusApi, s3: S3Deps) {
     this.cryplus = cryplus;
     this.s3 = s3;
   }

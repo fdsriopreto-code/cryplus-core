@@ -40,7 +40,7 @@ Postgres / S3   ← only ciphertext ever lands here
 | [`sdk/node/`](sdk/node) | Node/TypeScript SDK **+ Prisma extension**, migration helper, encrypted-S3 helper |
 | [`sdk/python/`](sdk/python) | Python SDK (stdlib only) |
 | [`examples/prisma-demo/`](examples/prisma-demo) | End-to-end tests: Prisma 7 + real Postgres (TypeScript, ESM) |
-| [`examples/prisma5-cjs/`](examples/prisma5-cjs) | End-to-end tests: Prisma 5.22 + plain JavaScript/CommonJS (no driver adapter) |
+| [`examples/prisma5-cjs/`](examples/prisma5-cjs) | End-to-end tests: Prisma 5.22 + plain JavaScript/CommonJS (no driver adapter), 40 tests, also run against the in-memory client |
 | [`examples/s3-demo/`](examples/s3-demo) | End-to-end tests: AWS SDK v3 (incl. multipart) + S3-compatible server |
 | [`tools/fakes3/`](tools/fakes3) | Tiny S3 emulator used by the tests (not AWS) |
 
@@ -157,6 +157,10 @@ In short:
 - **Backups and disaster recovery:** `cryplus-core file encrypt|decrypt` works offline with only the key file and passphrase (a failed decrypt leaves no file),
   and interoperates with the streaming API. `*_FILE` variants for secrets.
 - **Rollback:** `revertModel` writes plaintext back into a table; `migrateModel` encrypts/re-wraps again.
+- **Raw SQL safety net:** `cryplus-scan` (static scanner for CI) finds raw queries that touch encrypted columns using the real database names; the extension refuses them at runtime; `prisma.$cryplus` helpers cover the legitimate cases.
+- **Test mode:** `Cryplus.inMemory()` / `CRYPLUS_MODE=memory`: same API, no key service, repeatable, refuses production.
+- **Availability:** opt-in key cache with local AES (`--allow-key-export`), circuit breaker, `ready()`, Prometheus metrics; fails closed on cold or expired keys.
+- **Operations:** audit volume control (level, sampling, size rotation); schema preflight that rejects `@encrypted` on too-short `VarChar` columns and prints the `ALTER TABLE`.
 
 ## Running the tests
 
@@ -175,9 +179,12 @@ In short:
   write access to your database can swap two rows' values for the same field within one tenant and
   the swap will decrypt. (Cross-tenant, cross-field and cross-table moves *are* detected.)
 - **Blind indexes leak equality and frequency** of values (that is how search works). Don't mark
-  low-entropy fields (booleans, small enums) as `searchable`. Only equality search exists.
-- **Prisma raw SQL (`$queryRaw`/`$executeRaw`) bypasses the extension**, as does anything that talks
-  to the database without the extended client.
+  low-entropy fields (booleans, small enums) as `searchable`. Search is equality and fixed-length suffix only (substring search is done in memory on a bounded set).
+  A `global` index makes cross-tenant equality visible; a 4-digit `suffix` index has only 10^4 possible values.
+- **The key cache is a trade-off, not a free speedup:** keys in client memory, per-operation audit lost, revocation delayed by `ttlMs`. It is off by default.
+- **Raw SQL is guarded, not magically handled:** the extension refuses raw queries that mention encrypted columns and `cryplus-scan` finds them statically, but SQL built at
+  runtime can only be reported as "cannot analyze", and anything that talks to the database without the extended client (a second `PrismaClient`, a direct `pg` driver, BI tools) sees ciphertext.
+- **BullMQ sealing was tested with a stand-in for BullMQ**, not a real Redis. **The in-memory client is not interoperable with the real service** by design.
 - **Key backends:** the local file and passphrase sealing are tested. **AWS KMS is only tested
   against a mock**; **Vault is tested against a simulated transit API** and has an integration test
   (`CRYPLUS_TEST_VAULT_ADDR`) that has not yet been run against a real Vault. Validate both in your
@@ -195,11 +202,12 @@ In short:
 
 ## Roadmap
 
-Done: TLS/mTLS, per-service tokens, leader/follower HA with key reload, offline backup/DR tooling, rollback helper.
+Done: TLS/mTLS, per-service tokens, leader/follower HA with key reload, offline backup/DR tooling, rollback helper, raw-SQL scanner/guard/helpers, in-memory test mode,
+sealed BullMQ jobs, opt-in key cache with circuit breaker and metrics, suffix/global/normalized blind indexes, `String[]` and `Json` columns, throttled verifiable migration and `rotateModel`.
+Designed but not built: [per-tenant crypto-shredding](docs/DESIGN-crypto-shredding.md). Not built: n-gram (substring) indexes.
 
 1. External security review.
 2. Row-id binding (`recordId`) for client-generated ids.
-3. Platform-scoped blind index (lookups before the tenant is known, e.g. login) and suffix indexes (partial phone search).
 4. Plugins for other ORMs (Drizzle, TypeORM, SQLAlchemy, GORM).
 5. Transparent Postgres proxy (large; column rewriting breaks `WHERE/ORDER BY/LIKE`, so it needs a
    query-aware design). Deliberately **not** attempted until 1-3 are done.

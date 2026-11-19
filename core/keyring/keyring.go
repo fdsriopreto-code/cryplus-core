@@ -115,3 +115,11 @@ func aeadUnwrap(key, wrapped, aad []byte) ([]byte, error) {
 	}
 	return pt, nil
 }
+
+// Exporter is implemented by providers that can hand out a tenant-scoped key to a trusted client
+// (so it can encrypt locally with a short-lived cache). Remote HSM-style providers would not implement it.
+type Exporter interface {
+	// ExportTenantKEK returns the 32-byte KEK for (version, tenant). version 0 means the current version.
+	// It returns the version actually used.
+	ExportTenantKEK(ctx context.Context, version uint32, tenant string) (key []byte, used uint32, err error)
+}

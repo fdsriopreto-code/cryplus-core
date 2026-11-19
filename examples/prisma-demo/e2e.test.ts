@@ -238,7 +238,7 @@ describe("Prisma + Postgres end to end", () => {
     assert.equal((await raw.user.findFirstOrThrow()).cpf!.startsWith("cp1."), false, "dry run must not write");
 
     const s1 = await migrateModel(raw, cp, schema, { model: "User", tenantOf: orgOf, batchSize: 100 });
-    assert.deepEqual({ ...s1, failures: s1.failures.length }, { scanned: 450, encrypted: 900, rewrapped: 0, indexed: 0, failures: 0 });
+    assert.deepEqual({ scanned: s1.scanned, encrypted: s1.encrypted, rewrapped: s1.rewrapped, indexed: s1.indexed, failures: s1.failures.length }, { scanned: 450, encrypted: 900, rewrapped: 0, indexed: 0, failures: 0 });
 
     // app reads it through the extension; search works on migrated data
     await withTenant(orgA, async () => {
@@ -263,6 +263,18 @@ describe("Prisma + Postgres end to end", () => {
     await withTenant(sample.organizationId, async () => assert.ok(await db.user.findFirst({ where: { id: sample.id } })));
     const s4 = await migrateModel(raw, cp, schema, { model: "User", tenantOf: orgOf });
     assert.equal(s4.rewrapped, 0);
+  });
+
+  it("raw SQL guard works on Prisma 7 with a driver adapter too", async () => {
+    await withTenant(orgA, async () => {
+      await assert.rejects(db.$queryRawUnsafe(`SELECT cpf FROM "User" LIMIT 1`), /raw SQL touches encrypted data.*User/s);
+      await assert.rejects(db.$queryRaw`SELECT * FROM "Card"`, /selects every column/);
+      await assert.rejects(db.$executeRawUnsafe(`UPDATE "User" SET notes = 'x'`), /raw SQL touches encrypted data/);
+      // unrelated and reviewed SQL still runs
+      assert.equal(Number((await db.$queryRaw`SELECT count(*)::int AS n FROM "Organization"`)[0].n) >= 2, true);
+      const rows = await db.$queryRawUnsafe<{ cpf: string }[]>(`SELECT cpf /* cryplus:handled */ FROM "User" LIMIT 1`);
+      assert.match(rows[0]!.cpf, /^cp1\./);
+    });
   });
 
   it("throughput: 500 creates + 500-row read", async () => {

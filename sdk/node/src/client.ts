@@ -2,6 +2,11 @@ import { readFileSync } from "node:fs";
 import * as http from "node:http";
 import * as https from "node:https";
 import { Readable } from "node:stream";
+import { InMemoryCryplus, type InMemoryOptions } from "./memory.ts";
+import { CircuitBreaker, type BreakerOptions } from "./breaker.ts";
+import { KeyCache, type KeyCacheOptions, type KeyCacheStats } from "./keycache.ts";
+import * as lc from "./localcrypto.ts";
+import { combineSinks, Stats, type MetricsSink } from "./metrics.ts";
 
 /** Scopes a ciphertext. The same context must be used to decrypt. */
 export interface Context {
@@ -39,6 +44,29 @@ export interface ClientOptions {
   timeoutMs?: number;
   /** Max operations merged into a single HTTP batch. */
   maxBatch?: number;
+  /**
+   * Cache tenant keys in this process and encrypt/decrypt locally (AES in-process, zero round trips when warm; keeps
+   * working while the service is down, until the cached keys expire). OFF by default because the keys then live in this
+   * process's memory and individual operations are not audited by the service. Needs a service token with the `keys`
+   * role and a core started with --allow-key-export. See KeyCacheOptions.
+   */
+  keyCache?: KeyCacheOptions | boolean;
+  /** Cipher for data encrypted locally (default aes256gcm, hardware accelerated). Reading accepts both. */
+  localAlg?: lc.LocalAlg;
+  /** Fail fast while the service is unreachable (default on: 5 failures, 10 s). Pass false to disable. */
+  circuitBreaker?: BreakerOptions | false;
+  /** Receive metrics (see prometheusSink). Counters are always available through stats(). */
+  metrics?: MetricsSink;
+}
+
+/** Health of the client as seen from this process, for a readiness probe. */
+export interface ReadyReport {
+  /** true when requests can be served right now. */
+  ok: boolean;
+  /** `service`: reachable. `degraded`: unreachable but warm cached keys can still serve. `down`: neither. */
+  mode: "service" | "degraded" | "down";
+  breaker: "closed" | "open" | "half-open";
+  cache?: KeyCacheStats;
 }
 
 export class CryplusError extends Error {
@@ -50,6 +78,22 @@ export class CryplusError extends Error {
     this.code = code;
     this.status = status;
   }
+}
+
+/** What the SDK, the Prisma extension, the migration helpers and the job wrappers rely on. Implemented by the real client and the in-memory test client. */
+export interface CryplusApi {
+  encrypt(ctx: Context, plaintext: string | Uint8Array): Promise<string>;
+  decrypt(ctx: Context, ciphertext: string): Promise<string>;
+  decryptBytes(ctx: Context, ciphertext: string): Promise<Uint8Array>;
+  blindIndex(ctx: Context, value: string): Promise<string>;
+  rewrap(ctx: Context, ciphertext: string): Promise<{ ciphertext: string; changed: boolean }>;
+  keys(): Promise<{ provider: string; current: number; versions: { version: number; current: boolean }[] }>;
+  rotateKeys(): Promise<number>;
+  health(): Promise<boolean>;
+  encryptStream(ctx: Context, input: Readable): Promise<Readable>;
+  decryptStream(ctx: Context, input: Readable): Promise<Readable>;
+  rewrapStream(ctx: Context, input: Readable): Promise<Readable>;
+  close(): void;
 }
 
 type Op = "encrypt" | "decrypt" | "blind" | "rewrap";
@@ -66,7 +110,7 @@ const readEnvFile = (name: string): Buffer | undefined => {
   return p ? readFileSync(p) : undefined;
 };
 
-export class Cryplus {
+export class Cryplus implements CryplusApi {
   /** First configured URL (kept for compatibility). */
   readonly url: string;
   readonly urls: string[];
@@ -79,8 +123,18 @@ export class Cryplus {
   private tlsOpts: TlsOptions;
   private jsonAgent: http.Agent;
   private streamAgent: http.Agent;
+  private keyCache?: KeyCache;
+  private localAlg: lc.LocalAlg;
+  private breaker?: CircuitBreaker;
+  private counters = new Stats();
+  private sink: MetricsSink;
 
   constructor(opts: ClientOptions = {}) {
+    this.sink = combineSinks(this.counters, opts.metrics);
+    this.localAlg = opts.localAlg ?? "aes256gcm";
+    if (opts.circuitBreaker !== false) {
+      this.breaker = new CircuitBreaker(opts.circuitBreaker ?? {}, (to) => this.sink.inc("breaker_transitions_total", { to }));
+    }
     const raw = opts.url ?? process.env.CRYPLUS_URL ?? "http://127.0.0.1:7788";
     this.urls = (Array.isArray(raw) ? raw : raw.split(","))
       .map((u) => u.trim().replace(/\/$/, ""))
@@ -110,20 +164,101 @@ export class Cryplus {
     // so a pooled socket could be dead for the next call).
     this.jsonAgent = https_ ? new https.Agent({ keepAlive: true, ...agentOpts }) : new http.Agent({ keepAlive: true });
     this.streamAgent = https_ ? new https.Agent({ keepAlive: false, ...agentOpts }) : new http.Agent({ keepAlive: false });
+
+    if (opts.keyCache) {
+      this.keyCache = new KeyCache(
+        opts.keyCache === true ? {} : opts.keyCache,
+        async (tenant, version) => {
+          const r = await this.json<{ version: number; current: number; key: string }>("POST", "/v1/keys/tenant", version ? { tenant, version } : { tenant });
+          this.sink.inc("key_fetch_total", { result: "ok" });
+          return { version: r.version, current: r.current, key: Buffer.from(r.key, "base64") };
+        },
+        async (ctx) => {
+          const r = await this.json<{ key: string }>("POST", "/v1/keys/index", { tenant: ctx.tenant, collection: ctx.collection ?? "", field: ctx.field ?? "" });
+          return Buffer.from(r.key, "base64");
+        },
+        (event) => {
+          if (event === "fetch_error") this.sink.inc("key_fetch_total", { result: "error" });
+          else this.sink.inc("key_cache_total", { event });
+        },
+      );
+    }
+  }
+
+  /** Counters and timings collected so far (requests, errors, cache hits, breaker transitions...). */
+  stats() {
+    return { ...this.counters.snapshot(), cache: this.keyCache?.stats(), breaker: this.breaker?.state };
+  }
+
+  /** Drop (and wipe) every cached key. */
+  clearKeyCache() {
+    this.keyCache?.clear();
+  }
+
+  /**
+   * Readiness probe. `ok` is true when requests can be served: the service answers, or (degraded) keys for the tenants in
+   * use are still cached. Cheap: it reuses the breaker state and one /healthz call.
+   */
+  async ready(): Promise<ReadyReport> {
+    const breaker = this.breaker?.state ?? "closed";
+    const cache = this.keyCache?.stats();
+    const alive = breaker === "open" ? false : await this.health();
+    if (alive) return { ok: true, mode: "service", breaker: this.breaker?.state ?? "closed", cache };
+    const warm = !!cache && cache.usable > 0;
+    return { ok: warm, mode: warm ? "degraded" : "down", breaker: this.breaker?.state ?? "closed", cache };
+  }
+
+  /** Run one public operation with metrics. */
+  private async track<T>(op: string, mode: "local" | "service", fn: () => Promise<T>): Promise<T> {
+    const t0 = performance.now();
+    try {
+      const out = await fn();
+      this.sink.inc("requests_total", { op, mode, result: "ok" });
+      return out;
+    } catch (e) {
+      this.sink.inc("requests_total", { op, mode, result: "error" });
+      this.sink.inc("errors_total", { code: e instanceof CryplusError ? e.code.split(":")[0]! : "other" });
+      throw e;
+    } finally {
+      this.sink.observe("request_seconds", (performance.now() - t0) / 1000, { op, mode });
+    }
+  }
+
+  /**
+   * In-process client for TESTS: same API, no key service, no network. Refuses NODE_ENV=production.
+   * See InMemoryOptions (seed, explicit keys, deterministic mode).
+   */
+  static inMemory(opts?: InMemoryOptions): InMemoryCryplus {
+    return new InMemoryCryplus(opts);
   }
 
   /** Close idle pooled connections (call on shutdown so the process can exit promptly). */
   close() {
+    this.keyCache?.clear();
     this.jsonAgent.destroy();
     this.streamAgent.destroy();
   }
 
-  // ---- single-value API (auto-batched) -------------------------------------
+  // ---- single-value API (auto-batched; local when keyCache is on) ------------
+
+  private localErr(e: unknown): never {
+    if (e instanceof lc.LocalCryptoError) throw new CryplusError(e.code);
+    // a ciphertext naming a KEK version the service does not have is, like in the service itself, just "cannot decrypt"
+    if (e instanceof CryplusError && e.code === "unknown_key_version") throw new CryplusError("decryption_failed");
+    throw e;
+  }
 
   /** Encrypt a string or bytes; returns the "cp1.…" ciphertext string. */
   async encrypt(ctx: Context, plaintext: string | Uint8Array): Promise<string> {
     const b = typeof plaintext === "string" ? Buffer.from(plaintext, "utf8") : Buffer.from(plaintext);
-    return (await this.enqueue("encrypt", ctx, b.toString("base64"))).data;
+    if (this.keyCache) {
+      if (!ctx.tenant) throw new CryplusError("tenant_required");
+      return this.track("encrypt", "local", async () => {
+        const { version, kek } = await this.keyCache!.currentKek(ctx.tenant);
+        return lc.encryptLocal(kek, version, ctx, b, this.localAlg);
+      });
+    }
+    return this.track("encrypt", "service", async () => (await this.enqueue("encrypt", ctx, b.toString("base64"))).data);
   }
 
   /** Decrypt to a UTF-8 string. */
@@ -132,12 +267,27 @@ export class Cryplus {
   }
 
   async decryptBytes(ctx: Context, ciphertext: string): Promise<Uint8Array> {
-    return Buffer.from((await this.enqueue("decrypt", ctx, ciphertext)).data, "base64");
+    if (this.keyCache) {
+      if (!ctx.tenant) throw new CryplusError("tenant_required");
+      return this.track("decrypt", "local", async () => {
+        try {
+          const p = lc.parseEnvelope(ciphertext);
+          return lc.openLocal(await this.keyCache!.kek(ctx.tenant, p.version), p, ctx);
+        } catch (e) {
+          this.localErr(e);
+        }
+      });
+    }
+    return this.track("decrypt", "service", async () => Buffer.from((await this.enqueue("decrypt", ctx, ciphertext)).data, "base64"));
   }
 
   /** Deterministic keyed index for equality search over encrypted columns. */
   async blindIndex(ctx: Context, value: string): Promise<string> {
-    return (await this.enqueue("blind", ctx, Buffer.from(value, "utf8").toString("base64"))).data;
+    if (this.keyCache) {
+      if (!ctx.tenant) throw new CryplusError("tenant_required");
+      return this.track("blind", "local", async () => lc.blindIndexLocal(await this.keyCache!.indexKey(ctx), value));
+    }
+    return this.track("blind", "service", async () => (await this.enqueue("blind", ctx, Buffer.from(value, "utf8").toString("base64"))).data);
   }
 
   /** Move a ciphertext to the current KEK version without touching the payload. */
@@ -278,6 +428,7 @@ export class Cryplus {
   // ---- plumbing ------------------------------------------------------------
 
   private async json<T>(method: string, path: string, body?: unknown, auth = true): Promise<T> {
+    if (this.breaker && !this.breaker.allow()) throw new CryplusError("circuit_open");
     let last: unknown;
     // Walk the instances starting at the last one that worked; move on only when unreachable.
     for (let i = 0; i < this.urls.length; i++) {
@@ -285,12 +436,17 @@ export class Cryplus {
       try {
         const out = await this.jsonRetry<T>(this.urls[idx]!, method, path, body, auth);
         this.preferred = idx;
+        this.breaker?.success();
         return out;
       } catch (e) {
         last = e;
-        if (!(e instanceof CryplusError && e.code.startsWith("unreachable"))) throw e;
+        if (!(e instanceof CryplusError && e.code.startsWith("unreachable"))) {
+          this.breaker?.success(); // the service answered (with an error): it is alive
+          throw e;
+        }
       }
     }
+    this.breaker?.failure();
     throw last;
   }
 
@@ -344,4 +500,13 @@ export class Cryplus {
       req.end();
     });
   }
+}
+
+/**
+ * Build the right client for the environment: the in-memory test client when CRYPLUS_MODE=memory, otherwise the real one.
+ * Lets an application (and its test suite) share one code path.
+ */
+export function createCryplus(opts: ClientOptions & { memory?: InMemoryOptions } = {}): CryplusApi {
+  if (process.env.CRYPLUS_MODE === "memory") return new InMemoryCryplus(opts.memory);
+  return new Cryplus(opts);
 }

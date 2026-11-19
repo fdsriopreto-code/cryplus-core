@@ -55,6 +55,14 @@ Client side (Node): `new Cryplus({ url: ["https://core-1:7788","https://core-2:7
 or the environment: `CRYPLUS_URL` (comma-separated), `CRYPLUS_TOKEN`, `CRYPLUS_CA`, `CRYPLUS_CLIENT_CERT`, `CRYPLUS_CLIENT_KEY`.
 There is deliberately no "skip certificate verification" option.
 
+### Key export (opt-in, off by default)
+
+`--allow-key-export` lets services holding the **`keys`** role fetch tenant keys (`POST /v1/keys/tenant`, `/v1/keys/index`) so the Node SDK can encrypt locally with a short-lived cache
+(`new Cryplus({ keyCache: { ttlMs, staleMs } })`): zero round trips when warm, and it keeps serving while the service is briefly down. Read the trade-off before enabling it:
+the tenant key then lives in the client's memory, individual operations stop being audited per call (only key fetches are: `key_export`, `index_key_export`), a revoked service keeps
+working until its cached keys expire, and rotation reaches a client after its `ttlMs`. The `keys` role obeys the same tenant allowlist as everything else; give it only to services that need it, with the narrowest list.
+Every fetch is audited with the calling service, and refused attempts too.
+
 ## 3. The key file is the crown jewel
 
 - Losing the key file **or** the passphrase means the data is permanently unrecoverable. There is no backdoor.
@@ -94,7 +102,9 @@ verified, so a corrupt or truncated backup leaves no file that looks like a rest
 
 - **Audit log** (`--audit-log`, JSON lines): time, operation, service, tenant, collection, field, KEK version, ok/code, remote. Never plaintext, ciphertext or keys.
   Alert on bursts of `decryption_failed`, `tenant_forbidden`, `role_forbidden` and `unauthorized`.
-- **Health**: `GET /healthz` (no auth). Run at least two instances behind the SDK's URL list.
+- **Audit volume**: `--audit-level denied` logs only failures and administrative events (rotation, key export); `--audit-sample N` keeps 1 in N successful data operations (failures and administrative
+  events are never sampled); `--audit-max-mb M --audit-keep K` rolls the file over at M MiB and keeps K old files, so retention is bounded by about M * (K+1) MiB. Sampling and `denied` reduce what an investigation can see: choose deliberately.
+- **Health**: `GET /healthz` (no auth). Run at least two instances behind the SDK's URL list. In the application use `cryplus.ready()` (`service` / `degraded` / `down`) for readiness and `cryplus.stats()` or `prometheusSink(prom-client)` for metrics.
 - **Availability**: if every instance is down the app cannot read encrypted fields. Plan for that.
 - No rate limiting is built in; put the service on a private network.
 

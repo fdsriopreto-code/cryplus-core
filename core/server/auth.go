@@ -18,6 +18,7 @@ import (
 const (
 	RoleCrypt = "crypt" // encrypt, decrypt, blind index, rewrap, batch, streams
 	RoleAdmin = "admin" // key status and rotation
+	RoleKeys  = "keys"  // may fetch tenant keys to cache them in the SDK (needs --allow-key-export on the server)
 )
 
 // Service is one authenticated caller (e.g. "operax-api", "backup-job").
@@ -75,7 +76,7 @@ func NewSingleTokenAuth(token string) (*Auth, error) {
 	}
 	a := &Auth{}
 	a.entries = []entry{{
-		svc:  &Service{Name: "default", Roles: map[string]bool{RoleCrypt: true, RoleAdmin: true}, Tenants: []string{"*"}},
+		svc:  &Service{Name: "default", Roles: map[string]bool{RoleCrypt: true, RoleAdmin: true, RoleKeys: true}, Tenants: []string{"*"}},
 		hash: sha256.Sum256([]byte(token)),
 	}}
 	return a, nil
@@ -118,7 +119,7 @@ func (a *Auth) reload() error {
 		}
 		svc := &Service{Name: s.Name, Roles: map[string]bool{}, Tenants: s.Tenants}
 		for _, r := range s.Roles {
-			if r != RoleCrypt && r != RoleAdmin {
+			if r != RoleCrypt && r != RoleAdmin && r != RoleKeys {
 				return fmt.Errorf("tokens file: %s: unknown role %q", s.Name, r)
 			}
 			svc.Roles[r] = true

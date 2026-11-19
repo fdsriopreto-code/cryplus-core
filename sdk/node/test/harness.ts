@@ -22,6 +22,7 @@ async function freePort(): Promise<number> {
 }
 
 export interface Core {
+  port: number;
   url: string;
   token: string;
   dir: string;
@@ -36,11 +37,13 @@ export interface CoreOptions {
   scheme?: "http" | "https";
   /** Use a bare TCP connect for readiness (needed when mTLS rejects an anonymous health probe). */
   waitTcp?: boolean;
+  /** Listen on this port instead of a free one (to restart a core at the same address). */
+  port?: number;
 }
 
 export async function startCore(extraEnv: Record<string, string> = {}, o: CoreOptions = {}): Promise<Core> {
   const dir = mkdtempSync(path.join(tmpdir(), "cryplus-test-"));
-  const port = await freePort();
+  const port = o.port ?? (await freePort());
   const auditPath = path.join(dir, "audit.jsonl");
   const child: ChildProcess = spawn(
     CORE_BIN,
@@ -65,6 +68,7 @@ export async function startCore(extraEnv: Record<string, string> = {}, o: CoreOp
     await new Promise((r) => setTimeout(r, 50));
   }
   return {
+    port,
     url,
     token: TOKEN,
     dir,
