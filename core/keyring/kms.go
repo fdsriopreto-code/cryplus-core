@@ -58,7 +58,7 @@ func (k *KMSSealer) Open(ctx context.Context, blob, aad []byte) ([]byte, error) 
 
 // NewKMSFromEnv uses the standard AWS credential chain plus
 // CRYPLUS_KMS_KEY_ID and CRYPLUS_KEYFILE.
-func NewKMSFromEnv(ctx context.Context) (Provider, error) {
+func NewKMSFromEnv(ctx context.Context, follower bool) (Provider, error) {
 	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
 		return nil, err
@@ -67,5 +67,5 @@ func NewKMSFromEnv(ctx context.Context) (Provider, error) {
 	if err != nil {
 		return nil, err
 	}
-	return OpenSealed(ctx, envOr("CRYPLUS_KEYFILE", "cryplus-keys.kms.json"), s)
+	return open(ctx, envOr("CRYPLUS_KEYFILE", "cryplus-keys.kms.json"), s, follower)
 }

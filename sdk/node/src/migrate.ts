@@ -102,3 +102,61 @@ export async function migrateModel(prisma: any, cryplus: Cryplus, schema: Schema
   }
   return stats;
 }
+
+export interface RevertStats {
+  scanned: number;
+  decrypted: number;
+  failures: { id: unknown; field: string; error: string }[];
+}
+
+/**
+ * ROLLBACK: write the plaintext of every @encrypted column back into the table (blind-index columns are left
+ * in place, so you can encrypt again later). Use it if you must remove Cryplus from a model. It puts secrets
+ * back in clear text in the database, so run it deliberately, take a backup first, and encrypt again afterwards.
+ * Pass the BASE Prisma client. Rows that fail to decrypt are reported and left untouched.
+ */
+export async function revertModel(prisma: any, cryplus: Cryplus, schema: Schema, o: Omit<MigrateOptions, "dryRun"> & { dryRun?: boolean }): Promise<RevertStats> {
+  const model = schema.get(o.model);
+  if (!model) throw new Error(`cryplus: unknown model ${o.model}`);
+  const idField = model.idField;
+  if (!idField) throw new Error(`cryplus: model ${o.model} needs a single-column @id`);
+  const delegate = prisma[o.model.charAt(0).toLowerCase() + o.model.slice(1)];
+  if (!delegate) throw new Error(`cryplus: prisma client has no delegate for ${o.model}`);
+
+  const stats: RevertStats = { scanned: 0, decrypted: 0, failures: [] };
+  const batch = o.batchSize ?? 200;
+  let cursor: unknown = undefined;
+  for (;;) {
+    const rows: any[] = await delegate.findMany({
+      take: batch,
+      orderBy: { [idField]: "asc" },
+      ...(cursor !== undefined ? { skip: 1, cursor: { [idField]: cursor } } : {}),
+    });
+    if (rows.length === 0) break;
+    for (const row of rows) {
+      const data: Record<string, unknown> = {};
+      let tenant: string | undefined;
+      try {
+        tenant = await o.tenantOf(row);
+      } catch (e) {
+        stats.failures.push({ id: row[idField], field: "*", error: "tenantOf: " + (e as Error).message });
+        continue;
+      }
+      for (const enc of model.encrypted.values()) {
+        const v = row[enc.name];
+        if (typeof v !== "string" || !isCiphertext(v)) continue;
+        try {
+          data[enc.name] = await cryplus.decrypt({ tenant, collection: model.name, field: enc.name }, v);
+          stats.decrypted++;
+        } catch (e) {
+          stats.failures.push({ id: row[idField], field: enc.name, error: (e as Error).message });
+        }
+      }
+      if (!o.dryRun && Object.keys(data).length) await delegate.update({ where: { [idField]: row[idField] }, data });
+    }
+    stats.scanned += rows.length;
+    cursor = rows[rows.length - 1][idField];
+    if (rows.length < batch) break;
+  }
+  return stats;
+}

@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import * as http from "node:http";
 import * as https from "node:https";
 import { Readable } from "node:stream";
@@ -10,18 +11,35 @@ export interface Context {
   recordId?: string;
 }
 
+export interface TlsOptions {
+  /** CA certificate(s) (PEM text/Buffer) that signed the server certificate. */
+  ca?: string | Buffer;
+  /** Client certificate + key (PEM) for mutual TLS. */
+  cert?: string | Buffer;
+  key?: string | Buffer;
+  /** Override the name checked against the server certificate (e.g. when connecting by IP). */
+  servername?: string;
+}
+
 export interface ClientOptions {
-  /** Base URL of cryplus-core, e.g. http://127.0.0.1:7788 */
-  url?: string;
-  /** Bearer token (CRYPLUS_TOKEN). */
+  /**
+   * Base URL of cryplus-core, e.g. https://cryplus.internal:7788 (CRYPLUS_URL). For high availability
+   * pass several (array, or comma-separated in CRYPLUS_URL): JSON calls fail over to the next instance
+   * when one is unreachable. Streams do not fail over (their input is already being consumed).
+   */
+  url?: string | string[];
+  /** Bearer token for this service (CRYPLUS_TOKEN). */
   token?: string;
+  /**
+   * TLS settings. Also read from files named by CRYPLUS_CA, CRYPLUS_CLIENT_CERT and
+   * CRYPLUS_CLIENT_KEY. Certificates are always verified: there is deliberately no
+   * "skip verification" switch.
+   */
+  tls?: TlsOptions;
   timeoutMs?: number;
   /** Max operations merged into a single HTTP batch. */
   maxBatch?: number;
 }
-
-const NO_KEEPALIVE_HTTP = new http.Agent({ keepAlive: false });
-const NO_KEEPALIVE_HTTPS = new https.Agent({ keepAlive: false });
 
 export class CryplusError extends Error {
   code: string;
@@ -43,21 +61,61 @@ interface Pending {
   reject: (e: unknown) => void;
 }
 
+const readEnvFile = (name: string): Buffer | undefined => {
+  const p = process.env[name];
+  return p ? readFileSync(p) : undefined;
+};
+
 export class Cryplus {
+  /** First configured URL (kept for compatibility). */
   readonly url: string;
+  readonly urls: string[];
+  private preferred = 0;
   private token: string;
   private timeoutMs: number;
   private maxBatch: number;
   private queue: Pending[] = [];
   private scheduled = false;
+  private tlsOpts: TlsOptions;
+  private jsonAgent: http.Agent;
+  private streamAgent: http.Agent;
 
   constructor(opts: ClientOptions = {}) {
-    this.url = (opts.url ?? process.env.CRYPLUS_URL ?? "http://127.0.0.1:7788").replace(/\/$/, "");
+    const raw = opts.url ?? process.env.CRYPLUS_URL ?? "http://127.0.0.1:7788";
+    this.urls = (Array.isArray(raw) ? raw : raw.split(","))
+      .map((u) => u.trim().replace(/\/$/, ""))
+      .filter(Boolean);
+    if (this.urls.length === 0) throw new Error("cryplus: no URL configured");
+    this.url = this.urls[0]!;
     const t = opts.token ?? process.env.CRYPLUS_TOKEN;
     if (!t) throw new Error("cryplus: token required (opts.token or CRYPLUS_TOKEN)");
     this.token = t;
     this.timeoutMs = opts.timeoutMs ?? 15_000;
     this.maxBatch = opts.maxBatch ?? 500;
+
+    this.tlsOpts = {
+      ca: opts.tls?.ca ?? readEnvFile("CRYPLUS_CA"),
+      cert: opts.tls?.cert ?? readEnvFile("CRYPLUS_CLIENT_CERT"),
+      key: opts.tls?.key ?? readEnvFile("CRYPLUS_CLIENT_KEY"),
+      servername: opts.tls?.servername,
+    };
+    const schemes = new Set(this.urls.map((u) => new URL(u).protocol));
+    if (schemes.size > 1) throw new Error("cryplus: all URLs must use the same scheme (all http or all https)");
+    const https_ = schemes.has("https:");
+    if (!https_ && (this.tlsOpts.cert || this.tlsOpts.ca)) {
+      throw new Error("cryplus: TLS options were given but the URL is not https://");
+    }
+    const agentOpts = { ...this.tlsOpts };
+    // JSON calls reuse connections; streams never do (the server aborts the connection on tampering,
+    // so a pooled socket could be dead for the next call).
+    this.jsonAgent = https_ ? new https.Agent({ keepAlive: true, ...agentOpts }) : new http.Agent({ keepAlive: true });
+    this.streamAgent = https_ ? new https.Agent({ keepAlive: false, ...agentOpts }) : new http.Agent({ keepAlive: false });
+  }
+
+  /** Close idle pooled connections (call on shutdown so the process can exit promptly). */
+  close() {
+    this.jsonAgent.destroy();
+    this.streamAgent.destroy();
   }
 
   // ---- single-value API (auto-batched) -------------------------------------
@@ -128,9 +186,21 @@ export class Cryplus {
     return this.json("GET", "/v1/keys");
   }
 
-  /** Create a new KEK version. Existing data stays readable; run rewrap to migrate it. */
+  /** Create a new KEK version. Existing data stays readable; run rewrap/migrate to move it. Needs the admin role. */
   async rotateKeys(): Promise<number> {
-    return (await this.json<{ version: number }>("POST", "/v1/keys/rotate", {})).version;
+    // Only the leader can rotate. Try every instance until one accepts; followers answer 409.
+    let last: unknown;
+    for (let i = 0; i < this.urls.length; i++) {
+      const base = this.urls[(this.preferred + i) % this.urls.length]!;
+      try {
+        return (await this.jsonOnce<{ version: number }>(base, "POST", "/v1/keys/rotate", {}, true)).version;
+      } catch (e) {
+        last = e;
+        const retryable = e instanceof CryplusError && (e.code === "read_only_instance" || e.code.startsWith("unreachable"));
+        if (!retryable) throw e;
+      }
+    }
+    throw last;
   }
 
   async health(): Promise<boolean> {
@@ -165,15 +235,13 @@ export class Cryplus {
 
   private stream(path: string, ctx: Context, input: Readable): Promise<Readable> {
     return new Promise((resolve, reject) => {
-      const u = new URL(this.url + path);
+      const u = new URL(this.urls[this.preferred]! + path);
       const lib = u.protocol === "https:" ? https : http;
       const req = lib.request(
         u,
         {
           method: "POST",
-          // The server aborts the connection on tampering, so never reuse
-          // sockets for streams (a pooled dead socket would fail the next call).
-          agent: u.protocol === "https:" ? NO_KEEPALIVE_HTTPS : NO_KEEPALIVE_HTTP,
+          agent: this.streamAgent,
           headers: {
             Authorization: `Bearer ${this.token}`,
             "Content-Type": "application/octet-stream",
@@ -210,26 +278,70 @@ export class Cryplus {
   // ---- plumbing ------------------------------------------------------------
 
   private async json<T>(method: string, path: string, body?: unknown, auth = true): Promise<T> {
-    let res: Response;
-    try {
-      res = await fetch(this.url + path, {
-        method,
-        headers: {
-          ...(auth ? { Authorization: `Bearer ${this.token}` } : {}),
-          ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
-        },
-        body: body !== undefined ? JSON.stringify(body) : undefined,
-        signal: AbortSignal.timeout(this.timeoutMs),
-      });
-    } catch (e) {
-      throw new CryplusError("unreachable: " + (e as Error).message);
+    let last: unknown;
+    // Walk the instances starting at the last one that worked; move on only when unreachable.
+    for (let i = 0; i < this.urls.length; i++) {
+      const idx = (this.preferred + i) % this.urls.length;
+      try {
+        const out = await this.jsonRetry<T>(this.urls[idx]!, method, path, body, auth);
+        this.preferred = idx;
+        return out;
+      } catch (e) {
+        last = e;
+        if (!(e instanceof CryplusError && e.code.startsWith("unreachable"))) throw e;
+      }
     }
-    const text = await res.text();
-    let parsed: any = undefined;
+    throw last;
+  }
+
+  private async jsonRetry<T>(base: string, method: string, path: string, body: unknown, auth: boolean): Promise<T> {
     try {
-      parsed = text ? JSON.parse(text) : undefined;
-    } catch {}
-    if (!res.ok) throw new CryplusError(parsed?.error ?? `http_${res.status}`, res.status);
-    return parsed as T;
+      return await this.jsonOnce<T>(base, method, path, body, auth);
+    } catch (e) {
+      // A pooled keep-alive socket can be closed by the server between calls; the request then
+      // fails before any response. Retry once on a fresh socket.
+      if (e instanceof CryplusError && /unreachable:.*(ECONNRESET|socket hang up|EPIPE)/.test(e.code)) {
+        return this.jsonOnce<T>(base, method, path, body, auth);
+      }
+      throw e;
+    }
+  }
+
+  private jsonOnce<T>(base: string, method: string, path: string, body: unknown, auth: boolean): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const u = new URL(base + path);
+      const lib = u.protocol === "https:" ? https : http;
+      const payload = body !== undefined ? Buffer.from(JSON.stringify(body)) : undefined;
+      const req = lib.request(
+        u,
+        {
+          method,
+          agent: this.jsonAgent,
+          headers: {
+            ...(auth ? { Authorization: `Bearer ${this.token}` } : {}),
+            ...(payload ? { "Content-Type": "application/json", "Content-Length": payload.length } : {}),
+          },
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("error", (e) => reject(new CryplusError("unreachable: " + e.message)));
+          res.on("end", () => {
+            const text = Buffer.concat(chunks).toString("utf8");
+            let parsed: any = undefined;
+            try {
+              parsed = text ? JSON.parse(text) : undefined;
+            } catch {}
+            const status = res.statusCode ?? 0;
+            if (status < 200 || status >= 300) reject(new CryplusError(parsed?.error ?? `http_${status}`, status));
+            else resolve(parsed as T);
+          });
+        },
+      );
+      req.setTimeout(this.timeoutMs, () => req.destroy(new Error("timeout")));
+      req.on("error", (e) => reject(new CryplusError("unreachable: " + e.message)));
+      if (payload) req.write(payload);
+      req.end();
+    });
   }
 }

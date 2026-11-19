@@ -106,5 +106,71 @@ class CoreCase(unittest.TestCase):
         self.assertEqual(e.exception.code, "decryption_failed")
 
 
+
+class TlsCase(unittest.TestCase):
+    """mTLS + per-service token + failover, against the real binary."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="cryplus-py-tls-")
+        subprocess.run([BIN, "tls", "dev-certs", "--out", cls.tmp], check=True, capture_output=True)
+        tokens = os.path.join(cls.tmp, "tokens.json")
+        r = subprocess.run(
+            [BIN, "token", "new", "--name", "py", "--roles", "crypt,admin", "--tenants", "*", "--file", tokens],
+            check=True, capture_output=True, text=True,
+        )
+        cls.token = r.stdout.strip()
+        port = free_port()
+        cls.proc = subprocess.Popen(
+            [BIN, "--listen", f"127.0.0.1:{port}", "--keyfile", os.path.join(cls.tmp, "k.json"), "--audit-log", "",
+             "--tls-cert", os.path.join(cls.tmp, "server.pem"), "--tls-key", os.path.join(cls.tmp, "server-key.pem"),
+             "--client-ca", os.path.join(cls.tmp, "ca.pem"), "--tokens-file", tokens],
+            env={**os.environ, "CRYPLUS_TOKEN": ""},
+            stderr=subprocess.DEVNULL,
+        )
+        cls.url = f"https://127.0.0.1:{port}"
+        for _ in range(100):
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
+                break
+            except OSError:
+                time.sleep(0.05)
+        cls.paths = dict(ca=os.path.join(cls.tmp, "ca.pem"), cert=os.path.join(cls.tmp, "client.pem"), key=os.path.join(cls.tmp, "client-key.pem"))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate()
+        cls.proc.wait()
+
+    def test_mtls_roundtrip(self):
+        c = Cryplus(self.url, self.token, **self.paths)
+        ctx = Context("acme", "User", "cpf")
+        self.assertEqual(c.decrypt(ctx, c.encrypt(ctx, "seguro")), "seguro")
+        self.assertIsInstance(c.rotate_keys(), int)  # admin role
+
+    def test_no_client_cert_is_refused(self):
+        c = Cryplus(self.url, self.token, ca=self.paths["ca"])
+        with self.assertRaises(CryplusError) as e:
+            c.encrypt(Context("acme"), "x")
+        self.assertTrue(e.exception.code.startswith("unreachable"))
+
+    def test_untrusted_server_is_refused(self):
+        other = tempfile.mkdtemp(prefix="cryplus-py-other-")
+        subprocess.run([BIN, "tls", "dev-certs", "--out", other], check=True, capture_output=True)
+        c = Cryplus(self.url, self.token, ca=os.path.join(other, "ca.pem"), cert=self.paths["cert"], key=self.paths["key"])
+        with self.assertRaises(CryplusError) as e:
+            c.encrypt(Context("acme"), "x")
+        self.assertTrue(e.exception.code.startswith("unreachable"))
+
+    def test_tls_options_on_http_url_are_rejected(self):
+        with self.assertRaises(ValueError):
+            Cryplus("http://127.0.0.1:1", "x" * 20, ca=self.paths["ca"])
+
+    def test_failover_skips_dead_instance(self):
+        c = Cryplus(["https://127.0.0.1:1", self.url], self.token, **self.paths)
+        ctx = Context("acme")
+        self.assertEqual(c.decrypt(ctx, c.encrypt(ctx, "ha")), "ha")
+
+
 if __name__ == "__main__":
     unittest.main()

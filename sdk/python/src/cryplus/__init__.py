@@ -10,6 +10,7 @@ import base64
 import http.client
 import json
 import os
+import ssl
 from dataclasses import dataclass, asdict
 from typing import BinaryIO, Iterable, Optional
 from urllib.parse import urlparse
@@ -51,24 +52,61 @@ def _b64(b: bytes) -> str:
 
 
 class Cryplus:
-    def __init__(self, url: Optional[str] = None, token: Optional[str] = None, timeout: float = 15.0):
-        self.url = (url or os.environ.get("CRYPLUS_URL") or "http://127.0.0.1:7788").rstrip("/")
+    """Client for cryplus-core.
+
+    url may be one URL, a comma-separated string or a list (JSON calls fail over to the next instance
+    when one is unreachable; streams do not). For https:// pass ca= (and cert=/key= for mutual TLS),
+    or set CRYPLUS_CA / CRYPLUS_CLIENT_CERT / CRYPLUS_CLIENT_KEY. Certificates are always verified.
+    """
+
+    def __init__(
+        self,
+        url: "Optional[str | list[str]]" = None,
+        token: Optional[str] = None,
+        timeout: float = 15.0,
+        ca: Optional[str] = None,
+        cert: Optional[str] = None,
+        key: Optional[str] = None,
+    ):
+        raw = url or os.environ.get("CRYPLUS_URL") or "http://127.0.0.1:7788"
+        urls = raw if isinstance(raw, list) else raw.split(",")
+        self.urls = [u.strip().rstrip("/") for u in urls if u.strip()]
+        if not self.urls:
+            raise ValueError("cryplus: no URL configured")
+        self.url = self.urls[0]
         self._token = token or os.environ.get("CRYPLUS_TOKEN")
         if not self._token:
             raise ValueError("cryplus: token required (token= or CRYPLUS_TOKEN)")
         self.timeout = timeout
-        u = urlparse(self.url)
-        self._https = u.scheme == "https"
-        self._host = u.hostname or "127.0.0.1"
-        self._port = u.port or (443 if self._https else 80)
+        self._parsed = [urlparse(u) for u in self.urls]
+        schemes = {p.scheme for p in self._parsed}
+        if len(schemes) != 1:
+            raise ValueError("cryplus: all URLs must use the same scheme")
+        self._https = schemes == {"https"}
+        ca = ca or os.environ.get("CRYPLUS_CA")
+        cert = cert or os.environ.get("CRYPLUS_CLIENT_CERT")
+        key = key or os.environ.get("CRYPLUS_CLIENT_KEY")
+        if not self._https and (ca or cert):
+            raise ValueError("cryplus: TLS options were given but the URL is not https://")
+        self._ssl: Optional[ssl.SSLContext] = None
+        if self._https:
+            ctx = ssl.create_default_context(cafile=ca)  # verifies certificate and hostname
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+            if cert:
+                ctx.load_cert_chain(cert, key)
+            self._ssl = ctx
+        self._preferred = 0
 
     # -- connection ---------------------------------------------------------
-    def _conn(self) -> http.client.HTTPConnection:
-        cls = http.client.HTTPSConnection if self._https else http.client.HTTPConnection
-        return cls(self._host, self._port, timeout=self.timeout)
+    def _conn(self, idx: int) -> http.client.HTTPConnection:
+        p = self._parsed[idx]
+        host = p.hostname or "127.0.0.1"
+        if self._https:
+            return http.client.HTTPSConnection(host, p.port or 443, timeout=self.timeout, context=self._ssl)
+        return http.client.HTTPConnection(host, p.port or 80, timeout=self.timeout)
 
-    def _json_call(self, method: str, path: str, body: Optional[dict] = None):
-        c = self._conn()
+    def _json_once(self, idx: int, method: str, path: str, body: Optional[dict]):
+        c = self._conn(idx)
         try:
             headers = {"Authorization": f"Bearer {self._token}"}
             data = None
@@ -86,6 +124,21 @@ class Cryplus:
             raise CryplusError(f"unreachable: {e}") from e
         finally:
             c.close()
+
+    def _json_call(self, method: str, path: str, body: Optional[dict] = None):
+        last: Optional[Exception] = None
+        for i in range(len(self.urls)):
+            idx = (self._preferred + i) % len(self.urls)
+            try:
+                out = self._json_once(idx, method, path, body)
+                self._preferred = idx
+                return out
+            except CryplusError as e:
+                last = e
+                if not e.code.startswith("unreachable"):
+                    raise
+        assert last is not None
+        raise last
 
     # -- single values --------------------------------------------------------
     def batch(self, ops: Iterable[dict]) -> list:
@@ -116,7 +169,18 @@ class Cryplus:
         return self._json_call("GET", "/v1/keys")
 
     def rotate_keys(self) -> int:
-        return int(self._json_call("POST", "/v1/keys/rotate", {})["version"])
+        """Rotate the KEK. Only the leader can; followers answer read_only_instance, so try each instance."""
+        last: Optional[Exception] = None
+        for i in range(len(self.urls)):
+            idx = (self._preferred + i) % len(self.urls)
+            try:
+                return int(self._json_once(idx, "POST", "/v1/keys/rotate", {})["version"])
+            except CryplusError as e:
+                last = e
+                if e.code != "read_only_instance" and not e.code.startswith("unreachable"):
+                    raise
+        assert last is not None
+        raise last
 
     # -- streaming ------------------------------------------------------------
     def _stream(self, path: str, ctx: Context, src: BinaryIO, dst: BinaryIO) -> None:
@@ -127,7 +191,7 @@ class Cryplus:
                     return
                 yield chunk
 
-        c = self._conn()
+        c = self._conn(self._preferred)
         try:
             c.request(
                 "POST",

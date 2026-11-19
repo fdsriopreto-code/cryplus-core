@@ -15,7 +15,7 @@ Pop-Location
 Write-Host "== Node SDK ==" -ForegroundColor Cyan
 Push-Location "$root\sdk\node"
 npx tsc --noEmit; if ($LASTEXITCODE) { exit 1 }
-node --test --test-concurrency=1 test/client.test.ts test/prisma.test.ts; if ($LASTEXITCODE) { exit 1 }
+node --test --test-concurrency=1 test/client.test.ts test/prisma.test.ts test/tls.test.ts test/ha.test.ts test/backup.test.ts; if ($LASTEXITCODE) { exit 1 }
 npm run build | Out-Null
 Pop-Location
 

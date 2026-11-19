@@ -143,19 +143,32 @@ Cryplus encrypts on the client, so it composes with any server-side encryption t
 
 Any language can call the HTTP API (see [`core/server`](core/server/server.go)): `POST /v1/encrypt`,
 `/v1/decrypt`, `/v1/blind-index`, `/v1/rewrap`, `/v1/batch`, `/v1/stream/*`, `GET /v1/keys`,
-`POST /v1/keys/rotate`. The Python SDK is a ~150-line example of a thin client.
+`POST /v1/keys/rotate`. The Python SDK is a small example of a thin client (TLS/mTLS and failover included).
+
+## Running it for real
+
+[`docs/DEPLOY.md`](docs/DEPLOY.md) covers production operation; [`docs/OPERAX.md`](docs/OPERAX.md) is a worked integration plan.
+In short:
+
+- **TLS 1.3 only, optional mutual TLS.** Off-loopback addresses require `--allow-remote` *and* TLS. Server certificates are re-read on change.
+- **Per-service tokens** (`cryplus-core token new`): stored only as SHA-256, with roles (`crypt`, `admin`) and a **tenant allowlist**; revoke by editing the file, no restart.
+- **High availability:** one leader plus any number of `--follower` instances share a sealed key file. Followers pick up rotations on their own, reject any
+  file change that rewrites history, and keep serving if the leader dies. The SDKs take several URLs and fail over.
+- **Backups and disaster recovery:** `cryplus-core file encrypt|decrypt` works offline with only the key file and passphrase (a failed decrypt leaves no file),
+  and interoperates with the streaming API. `*_FILE` variants for secrets.
+- **Rollback:** `revertModel` writes plaintext back into a table; `migrateModel` encrypts/re-wraps again.
 
 ## Running the tests
 
 ```powershell
-./scripts/test-all.ps1     # Go + Node + Python; add -E2E to also run Prisma/Postgres and S3 suites
+./scripts/test-all.ps1     # Go + Node + Python (incl. TLS, HA, backup drills); add -E2E for Prisma/Postgres and S3 suites
 ```
 
 ## Limitations (read this)
 
 - **Not audited.** Get an external review before protecting anything you cannot afford to lose.
 - **Compromised app ⇒ compromised data.** The app (and anything holding `CRYPLUS_TOKEN`) can ask the
-  sidecar to decrypt what its tenants may read. Cryplus protects data **at rest and in dumps**, it
+  service to decrypt what its tenants may read. Cryplus protects data **at rest and in dumps**, it
   does not stop a fully compromised application server. Tenant scoping and the audit log limit and
   reveal the blast radius.
 - **No row binding.** Ciphertext is bound to tenant/model/field, not to the row id. Someone with
@@ -173,19 +186,23 @@ Any language can call the HTTP API (see [`core/server`](core/server/server.go)):
   per-record encryption fast and cheap); it is not a per-record HSM call.
 - **Windows:** key-file mode `0600` is not enforced by the OS there. Use the passphrase/Vault/KMS
   sealing and an ACL-restricted directory.
-- The sidecar speaks plain HTTP on loopback and refuses other addresses unless `--allow-remote`.
-  There is no built-in TLS/mTLS yet; put a TLS terminator in front if you must go off-host.
+- Plain HTTP is loopback-only; anything else requires TLS (see above). The bundled dev certificates are for tests, use your own PKI in production.
+- **Shared key file:** leader and followers must share the file through a filesystem with atomic rename and exclusive create (a local volume shared on one host is
+  fine). Network filesystems (NFS/SMB) are **not tested** and may delay or weaken reload and locking. Exactly one leader should rotate.
+- The `Dockerfile` and compose file in docs/DEPLOY.md were **not built or run** in the environment this was developed in.
 - No rate limiting. A transparent Postgres wire-protocol proxy is **not** implemented (see below).
 - Tested with Prisma 7.10.1 (ESM/TS) and 5.22.0 (CommonJS/JS), Node 24, Go 1.27, PostgreSQL 18. The SDK ships both ESM and CJS builds.
 
 ## Roadmap
 
+Done: TLS/mTLS, per-service tokens, leader/follower HA with key reload, offline backup/DR tooling, rollback helper.
+
 1. External security review.
 2. Row-id binding (`recordId`) for client-generated ids.
-3. TLS/mTLS between app and sidecar; per-service tokens.
+3. Platform-scoped blind index (lookups before the tenant is known, e.g. login) and suffix indexes (partial phone search).
 4. Plugins for other ORMs (Drizzle, TypeORM, SQLAlchemy, GORM).
 5. Transparent Postgres proxy (large; column rewriting breaks `WHERE/ORDER BY/LIKE`, so it needs a
-   query-aware design). Deliberately **not** attempted until 1–3 are done.
+   query-aware design). Deliberately **not** attempted until 1-3 are done.
 
 ## License
 

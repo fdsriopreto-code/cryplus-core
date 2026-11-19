@@ -109,7 +109,7 @@ func NewVaultSealer(ctx context.Context, addr, token, mount, key string) (*Vault
 
 // NewVaultFromEnv builds the provider the CLI exposes: VAULT_ADDR,
 // VAULT_TOKEN, CRYPLUS_VAULT_MOUNT, CRYPLUS_VAULT_KEY, CRYPLUS_KEYFILE.
-func NewVaultFromEnv() (Provider, error) {
+func NewVaultFromEnv(follower bool) (Provider, error) {
 	addr, tok := os.Getenv("VAULT_ADDR"), os.Getenv("VAULT_TOKEN")
 	if addr == "" || tok == "" {
 		return nil, errors.New("set VAULT_ADDR and VAULT_TOKEN")
@@ -119,7 +119,7 @@ func NewVaultFromEnv() (Provider, error) {
 	if err != nil {
 		return nil, err
 	}
-	return OpenSealed(ctx, envOr("CRYPLUS_KEYFILE", "cryplus-keys.vault.json"), s)
+	return open(ctx, envOr("CRYPLUS_KEYFILE", "cryplus-keys.vault.json"), s, follower)
 }
 
 func envOr(k, d string) string {

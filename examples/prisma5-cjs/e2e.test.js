@@ -8,7 +8,7 @@ const { tmpdir } = require("node:os");
 const path = require("node:path");
 const { after, before, describe, it } = require("node:test");
 const { PrismaClient } = require("@prisma/client");
-const { Cryplus, migrateModel, parseSchema, withCryplus, withTenant } = require("cryplus");
+const { Cryplus, migrateModel, revertModel, parseSchema, withCryplus, withTenant } = require("cryplus");
 
 const DB = "postgresql://cryplus:cryplus@127.0.0.1:54329/cryplus_demo?schema=p5";
 const BIN = path.resolve(__dirname, "../../bin/cryplus-core.exe");
@@ -251,5 +251,27 @@ describe("Prisma 5.22 + CommonJS", () => {
     });
     const s3 = await migrateModel(raw, cp, schema, { model: "Funcionario", tenantOf: (r) => r.tenantId });
     assert.equal(s3.rewrapped + s3.encrypted, 0, "migration must be idempotent");
+  });
+
+  it("ROLLBACK: revertModel puts plaintext back, is safe to re-run, and the data can be encrypted again", async () => {
+    await withTenant(tenantB, async () => {
+      assert.equal((await db.funcionario.findFirst({ where: { tenantId: tenantB, cpf: "70000000011" } }))?.rg, "rg11");
+    });
+    const dry = await revertModel(raw, cp, schema, { model: "Funcionario", tenantOf: (r) => r.tenantId, dryRun: true });
+    assert.ok(dry.decrypted >= 240 && dry.failures.length === 0);
+    assert.match((await raw.funcionario.findFirstOrThrow({ where: { tenantId: tenantB } })).cpf, /^cp1\./, "dry run must not write");
+
+    const s = await revertModel(raw, cp, schema, { model: "Funcionario", tenantOf: (r) => r.tenantId, batchSize: 70 });
+    assert.equal(s.failures.length, 0);
+    const back = await raw.funcionario.findFirstOrThrow({ where: { tenantId: tenantB, nome: "L11" } });
+    assert.equal(back.cpf, "70000000011");
+    assert.equal(back.rg, "rg11");
+    assert.ok(back.cpfIdx, "blind index must be left in place");
+    assert.equal((await revertModel(raw, cp, schema, { model: "Funcionario", tenantOf: (r) => r.tenantId })).decrypted, 0, "second run is a no-op");
+
+    // and forward again
+    const again = await migrateModel(raw, cp, schema, { model: "Funcionario", tenantOf: (r) => r.tenantId });
+    assert.equal(again.failures.length, 0);
+    assert.match((await raw.funcionario.findFirstOrThrow({ where: { tenantId: tenantB, nome: "L11" } })).cpf, /^cp1\./);
   });
 });

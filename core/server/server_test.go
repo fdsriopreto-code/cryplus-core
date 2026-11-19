@@ -196,7 +196,7 @@ func TestStreamOverHTTP(t *testing.T) {
 func TestRefusesPublicBind(t *testing.T) {
 	p, _ := keyring.NewMemory()
 	s, _ := New(envelope.New(p, 0), nil, tok)
-	if err := s.Serve(t.Context(), "0.0.0.0:0", false); err == nil || !strings.Contains(err.Error(), "loopback") {
+	if err := s.Serve(t.Context(), "0.0.0.0:0", ServeOptions{}); err == nil || !strings.Contains(err.Error(), "loopback") {
 		t.Fatalf("want loopback refusal, got %v", err)
 	}
 }

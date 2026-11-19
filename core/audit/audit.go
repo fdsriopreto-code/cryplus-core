@@ -12,6 +12,7 @@ import (
 type Event struct {
 	Time       time.Time `json:"ts"`
 	Op         string    `json:"op"`
+	Service    string    `json:"service,omitempty"`
 	Tenant     string    `json:"tenant,omitempty"`
 	Collection string    `json:"collection,omitempty"`
 	Field      string    `json:"field,omitempty"`
