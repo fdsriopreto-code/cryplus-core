@@ -17,12 +17,15 @@ const ct = await cryplus.encrypt({ tenant: 'acme', collection: 'User', field: 'c
 | `new Cryplus(opts)` | client: `encrypt`, `decrypt`, `blindIndex`, `rewrap`, streams, `rotateKeys`, `ready()`, `stats()`; options `keyCache`, `circuitBreaker`, `metrics`, `tls`, multiple URLs |
 | `Cryplus.inMemory(opts)` / `createCryplus()` | in-process client for tests (`CRYPLUS_MODE=memory`); refuses `NODE_ENV=production` |
 | `withCryplus(prisma, { cryplus, schemaPath, tenant, rawGuard, plaintext, metrics })` | Prisma extension driven by `/// @encrypted(...)` comments; adds `prisma.$cryplus` helpers |
-| `withTenant(id, fn)` | ambient tenant (AsyncLocalStorage); awaits `fn` inside the scope |
+| `withTenant(id, fn)` / `cryplusTenantMiddleware(req => req.tenantId)` | ambient tenant (AsyncLocalStorage); awaits `fn` inside the scope / Express middleware |
 | `npx cryplus-scan --schema prisma/schema.prisma --src src` | finds raw SQL touching encrypted columns |
 | `encryptedQueue(queue, cryplus)` / `encryptedWorker(cryplus, processor)` | keep job data out of Redis in clear text |
-| `migrateModel` / `rotateModel` / `revertModel` | encrypt existing data, rotate keys, roll back; resumable, throttled, verifiable |
+| `migrateModel` / `rotateModel` / `revertModel` | encrypt existing data, rotate keys, bind rows, roll back; resumable, throttled, concurrent, sampled verification, ETA |
 | `EncryptedS3` | client-side encrypted S3 objects |
 | `parseSchema`, `ciphertextLength` | schema reader and exact ciphertext sizing |
+
+Prisma extension options: `tenantFrom` (tables without a tenant column), `tenantFromArgs`, `plaintext` (per model), `rowBinding` (`on`/`strict`), `legacy: 'fallback'`, `rawGuard`, `metrics`.
+Filters on encrypted fields behave like plaintext ones (verified by a generated oracle test), `undefined` means "no filter", and anything not rewritten is refused.
 
 Directive syntax: `/// @encrypted`, `@encrypted(searchable, digits)`, `@encrypted(global)`, `@encrypted(suffix(4), suffix(8), br-phone-canonical)`, `@encrypted(max(14))`.
 Supported column types: `String`, `String[]`, `Json`. Full guide for a real integration: `docs/OPERAX.md` in the repository.

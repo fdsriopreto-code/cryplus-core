@@ -299,3 +299,127 @@ describe("metrics", () => {
     assert.equal(sink.get("prisma_errors_total", { code: "unsupported_query", model: "U", operation: "findFirst" }), 1);
   });
 });
+
+describe("mixed read/write load with the key cache (real core)", () => {
+  it("8 workers x 5 tenants, local and service paths side by side, a key rotation AND a service restart in the middle: nothing lost, nothing wrong", async () => {
+    let core = await open();
+    const port = core.port;
+    const app = client(port, tokApp, { keyCache: { ttlMs: 400, staleMs: 6000 }, circuitBreaker: false });
+    const svc = client(port, tokCryptOnly, { circuitBreaker: false });
+    const ops = client(port, tokOps);
+    let stopped = false;
+    try {
+    const tenants = ["mx-0", "mx-1", "mx-2", "mx-3", "mx-4"];
+    const c = (tenant: string, recordId?: string) => ({ tenant, collection: "Mensagem", field: "conteudo", ...(recordId ? { recordId } : {}) });
+    let firstVersion = 0;
+    for (const t of tenants) firstVersion = parseEnvelope(await app.encrypt(c(t), "warm")).version; // every tenant is warm before anything goes wrong
+
+    type Rec = { tenant: string; id: string; plain: string; ct: string; by: "local" | "service" };
+    const records: Rec[] = [];
+    const errors: string[] = []; // wrong results, and ANY error on the local path
+    const serviceErrors: string[] = []; // errors on the service path: only legitimate when the service was going away
+    let outage = false;
+    // After a rotation the service starts writing with the NEW version at once, while this process only learns it after the ttl.
+    // Reading such a value needs a key this process has never fetched ("cold", and rightly fail-closed if the service is slow),
+    // so service-side writes pause until the local cache has been warmed with the new version.
+    let serviceWrites = true;
+    const counts = { writes: 0, reads: 0, indexes: 0, serviceOps: 0 };
+    const rnd = (n: number) => Math.floor(Math.random() * n);
+
+    const worker = async (w: number) => {
+      let i = 0;
+      while (!stopped) {
+        i++;
+        await sleep(1); // pace the workers: this is a mixed load, not a flood
+        const tenant = tenants[rnd(tenants.length)]!;
+        const r = Math.random();
+        let path: "local" | "service" = "local";
+        let what = "";
+        try {
+          if (r < 0.45 || records.length < 20) {
+            what = "encrypt";
+            const id = `w${w}-${i}`;
+            const plain = `msg ${id} ${"x".repeat(rnd(200))} ação`;
+            const useService = !outage && serviceWrites && Math.random() < 0.3;
+            path = useService ? "service" : "local";
+            const ct = await (useService ? svc : app).encrypt(c(tenant, id), plain);
+            if (useService) counts.serviceOps++;
+            records.push({ tenant, id, plain, ct, by: useService ? "service" : "local" });
+            counts.writes++;
+          } else if (r < 0.9) {
+            what = "decrypt";
+            const rec = records[rnd(records.length)]!;
+            const useService = !outage && Math.random() < 0.3;
+            path = useService ? "service" : "local";
+            const got = await (useService ? svc : app).decrypt(c(rec.tenant, rec.id), rec.ct);
+            if (useService) counts.serviceOps++;
+            if (got !== rec.plain) errors.push(`wrong plaintext for ${rec.id} (written ${rec.by}, read ${useService ? "service" : "local"})`);
+            counts.reads++;
+          } else {
+            what = "blindIndex";
+            const v = String(rnd(1000));
+            const local = await app.blindIndex(c(tenant), v);
+            if (!outage) {
+              path = "service";
+              const remote = await svc.blindIndex(c(tenant), v);
+              if (local !== remote) errors.push("blind index differs between local and service");
+              counts.serviceOps++;
+            }
+            counts.indexes++;
+          }
+        } catch (e) {
+          (path === "local" ? errors : serviceErrors).push(`${path} ${what} t+${Date.now() - t0}ms outage=${outage}: ${(e as Error).message}`);
+        }
+      }
+    };
+
+    const t0 = Date.now();
+    const workers = Array.from({ length: 8 }, (_, w) => worker(w));
+    await sleep(600);
+    serviceWrites = false;
+    const version = await ops.rotateKeys(); // new data will use the new version once the cache refreshes
+    await sleep(500); // > ttl: the cache now refreshes its view of the current version
+    for (const t of tenants) assert.equal(parseEnvelope(await app.encrypt(c(t), "warm v2")).version, version);
+    serviceWrites = true;
+    await sleep(300);
+    outage = true; // workers stop using the service path (the local path must keep working)...
+    await sleep(150); // ...let the service calls already in flight finish
+    await core.stop(); // the service disappears under load
+    await sleep(900);
+    core = await open([], port); // and comes back at the same address with the same key file
+    await sleep(500);
+    outage = false;
+    await sleep(500);
+    stopped = true;
+    await Promise.all(workers);
+
+    assert.deepEqual([...new Set(errors)].slice(0, 5), [], `errors during the run: ${errors.length}`);
+    // a service call may fail only because the service was being stopped (in flight at that instant), never for another reason
+    assert.deepEqual(serviceErrors.filter((e) => !/unreachable|ECONNRESET|ECONNREFUSED|socket hang up/.test(e)), []);
+    assert.ok(serviceErrors.length < 40, `service-path errors: ${serviceErrors.length}`);
+    assert.ok(counts.writes > 300 && counts.reads > 300, JSON.stringify(counts));
+    // everything ever written (locally or by the service, before, during and after the outage) opens, on both paths
+    let versions = new Set<number>();
+    for (const rec of records) versions.add(parseEnvelope(rec.ct).version);
+    const sample = (n: number) => Array.from({ length: Math.min(n, records.length) }, () => records[rnd(records.length)]!);
+    const byService = records.filter((r) => r.by === "service").slice(0, 100);
+    for (const rec of [...sample(400), ...byService]) assert.equal(await svc.decrypt(c(rec.tenant, rec.id), rec.ct), rec.plain, `${rec.id} via service`);
+    for (const rec of sample(300)) assert.equal(await app.decrypt(c(rec.tenant, rec.id), rec.ct), rec.plain, `${rec.id} via local`);
+    assert.ok(versions.has(firstVersion) && versions.has(version), `both key versions were used: ${[...versions]}`);
+    const st = app.stats().cache!;
+    // lookups answered without waiting for the service: fresh hits plus stale keys served; only real misses cost a round trip
+    const lookups = st.hits + st.misses + st.staleServed;
+    assert.ok(st.misses / lookups < 0.15, `cache misses ${(st.misses / lookups).toFixed(3)} of lookups (${JSON.stringify(st)})`);
+    assert.ok(st.staleServed >= 1, "the outage was ridden out on stale keys");
+    assert.equal(st.fetchErrors > 0, true);
+    console.log(`    mixed load: ${JSON.stringify(counts)}, records ${records.length}, versions ${[...versions]}, cache ${JSON.stringify(st)}`);
+    } finally {
+      // always release everything, so a failed assertion cannot leave a core process or open sockets behind
+      stopped = true;
+      app.close();
+      svc.close();
+      ops.close();
+      await core.stop();
+    }
+  });
+});

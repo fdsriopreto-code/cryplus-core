@@ -38,6 +38,8 @@ export function rawGuardHooks(schema: Schema, mode: RawGuardMode) {
 export interface RawTenantOpt {
   /** Tenant to use instead of the resolver / ambient tenant. */
   tenant?: string;
+  /** Primary key of the row (required to encrypt/decrypt for a model bound with `rowBinding`). */
+  recordId?: string;
 }
 
 function findField(model: ModelInfo, nameOrColumn: string): EncryptedField | undefined {
@@ -83,7 +85,7 @@ export function createRawHelpers(c: CryptoLike, schema: Schema, resolveTenant: (
     /** Value to write into the column in a raw INSERT/UPDATE (the app value in, the stored value out). */
     async encryptValue(model: string, field: string, value: unknown, opts: RawTenantOpt = {}): Promise<unknown> {
       const { m, e } = target(model, field);
-      return tx(opts.tenant).encryptValue(m, e, value);
+      return tx(opts.tenant).encryptValue(m, e, value, opts.recordId);
     },
 
     /** All index column values that must be written together with the encrypted column. */
@@ -94,7 +96,7 @@ export function createRawHelpers(c: CryptoLike, schema: Schema, resolveTenant: (
 
     async decryptValue(model: string, field: string, stored: unknown, opts: RawTenantOpt = {}): Promise<unknown> {
       const { m, e } = target(model, field);
-      return tx(opts.tenant).decryptValue(m, e, stored);
+      return tx(opts.tenant).decryptValue(m, e, stored, opts.recordId);
     },
 
     /**
@@ -107,11 +109,15 @@ export function createRawHelpers(c: CryptoLike, schema: Schema, resolveTenant: (
       if (!m) throw new CryplusPrismaError(`unknown model ${model}`);
       const t = tx(opts.tenant);
       const tasks: Promise<void>[] = [];
+      const idField = m.idField ? m.fields.get(m.idField) : undefined;
       for (const row of rows) {
+        // with rowBinding the primary key is part of what was encrypted: it must be in the row (select it)
+        const idKey = Object.keys(row).find((k) => (opts.columns?.[k] ?? k) === idField?.name || (opts.columns?.[k] ?? k) === idField?.dbName);
+        const rid = idKey && typeof row[idKey] === "string" ? (row[idKey] as string) : undefined;
         for (const key of Object.keys(row)) {
           const e = findField(m, opts.columns?.[key] ?? key);
           if (!e) continue;
-          tasks.push(t.decryptValue(m, e, row[key]).then((p) => void ((row as any)[key] = p)));
+          tasks.push(t.decryptValue(m, e, row[key], rid).then((p) => void ((row as any)[key] = p)));
         }
       }
       await Promise.all(tasks);

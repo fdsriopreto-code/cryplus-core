@@ -40,7 +40,8 @@ Postgres / S3   ← only ciphertext ever lands here
 | [`sdk/node/`](sdk/node) | Node/TypeScript SDK **+ Prisma extension**, migration helper, encrypted-S3 helper |
 | [`sdk/python/`](sdk/python) | Python SDK (stdlib only) |
 | [`examples/prisma-demo/`](examples/prisma-demo) | End-to-end tests: Prisma 7 + real Postgres (TypeScript, ESM) |
-| [`examples/prisma5-cjs/`](examples/prisma5-cjs) | End-to-end tests: Prisma 5.22 + plain JavaScript/CommonJS (no driver adapter), 40 tests, also run against the in-memory client |
+| [`examples/prisma5-cjs/`](examples/prisma5-cjs) | End-to-end tests: Prisma 5.22 + plain JavaScript/CommonJS (no driver adapter), 40 compatibility tests (also against the in-memory client) plus the filter-equivalence oracle and feature suites |
+| [`examples/bullmq-redis/`](examples/bullmq-redis), [`examples/alpine/`](examples/alpine) | Real BullMQ + Redis (Docker), and `node:20-alpine` (musl) with Prisma 5.22 and a linux core (Docker) |
 | [`examples/s3-demo/`](examples/s3-demo) | End-to-end tests: AWS SDK v3 (incl. multipart) + S3-compatible server |
 | [`tools/fakes3/`](tools/fakes3) | Tiny S3 emulator used by the tests (not AWS) |
 
@@ -175,16 +176,18 @@ In short:
   service to decrypt what its tenants may read. Cryplus protects data **at rest and in dumps**, it
   does not stop a fully compromised application server. Tenant scoping and the audit log limit and
   reveal the blast radius.
-- **No row binding.** Ciphertext is bound to tenant/model/field, not to the row id. Someone with
-  write access to your database can swap two rows' values for the same field within one tenant and
-  the swap will decrypt. (Cross-tenant, cross-field and cross-table moves *are* detected.)
+- **Row binding is opt-in (`rowBinding: "on" | "strict"` in the Prisma extension).** By default ciphertext is bound to tenant/model/field, not to the row id: someone with
+  write access to your database can swap two rows' values for the same field within one tenant and the swap will decrypt. (Cross-tenant, cross-field and cross-table moves *are*
+  detected.) With `rowBinding` the primary key is authenticated too and the swap fails on read; it applies to models with a single `String` id, requires writes of encrypted
+  values to identify the row by id, and has a migration path (`rotateModel({ bindRows: true })`). Details and costs in `docs/OPERAX.md`. Not available through the raw SDK calls
+  unless you pass `recordId` yourself.
 - **Blind indexes leak equality and frequency** of values (that is how search works). Don't mark
   low-entropy fields (booleans, small enums) as `searchable`. Search is equality and fixed-length suffix only (substring search is done in memory on a bounded set).
   A `global` index makes cross-tenant equality visible; a 4-digit `suffix` index has only 10^4 possible values.
 - **The key cache is a trade-off, not a free speedup:** keys in client memory, per-operation audit lost, revocation delayed by `ttlMs`. It is off by default.
 - **Raw SQL is guarded, not magically handled:** the extension refuses raw queries that mention encrypted columns and `cryplus-scan` finds them statically, but SQL built at
   runtime can only be reported as "cannot analyze", and anything that talks to the database without the extended client (a second `PrismaClient`, a direct `pg` driver, BI tools) sees ciphertext.
-- **BullMQ sealing was tested with a stand-in for BullMQ**, not a real Redis. **The in-memory client is not interoperable with the real service** by design.
+- **BullMQ sealing was tested against real BullMQ + Redis** (job data only: return values and failure messages are not sealed). **The in-memory client is not interoperable with the real service** by design.
 - **Key backends:** the local file and passphrase sealing are tested. **AWS KMS is only tested
   against a mock**; **Vault is tested against a simulated transit API** and has an integration test
   (`CRYPLUS_TEST_VAULT_ADDR`) that has not yet been run against a real Vault. Validate both in your

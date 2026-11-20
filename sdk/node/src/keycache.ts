@@ -10,11 +10,19 @@ export interface KeyCacheOptions {
   staleMs?: number;
   /** Maximum cached keys (default 1000); the oldest are wiped first. */
   maxEntries?: number;
+  /**
+   * After a failed refresh of an expired key that is still inside the stale window, do not ask the service again for this long
+   * (default 1000 ms); keep serving the stale key meanwhile. Without it every operation during an outage would try, and wait for, a
+   * connection to a service that is down.
+   */
+  retryMs?: number;
 }
 
 interface Entry<T> {
   value: T;
   at: number;
+  /** When the last refresh of this (expired) entry failed. */
+  failedAt?: number;
 }
 
 export interface TenantKeyReply {
@@ -48,6 +56,7 @@ export class KeyCache {
   private ttl: number;
   private stale: number;
   private max: number;
+  private retry: number;
   private keks = new Map<string, Entry<Buffer>>();
   private current = new Map<string, Entry<number>>();
   private index = new Map<string, Entry<Buffer>>();
@@ -69,6 +78,7 @@ export class KeyCache {
     this.ttl = o.ttlMs ?? 300_000;
     this.stale = o.staleMs ?? 0;
     this.max = o.maxEntries ?? 1000;
+    this.retry = o.retryMs ?? 1000;
   }
 
   stats(): KeyCacheStats {
@@ -106,6 +116,12 @@ export class KeyCache {
       this.emit("hit");
       return e.value;
     }
+    // an expired key whose refresh just failed: keep serving it (inside the stale window) without hammering the service
+    if (e && e.failedAt !== undefined && now - e.failedAt < this.retry && now - e.at < this.ttl + this.stale) {
+      this.s.staleServed++;
+      this.emit("stale");
+      return e.value;
+    }
     this.s.misses++;
     this.emit("miss");
     let p = this.inflight.get(key) as Promise<T> | undefined;
@@ -121,6 +137,7 @@ export class KeyCache {
       this.s.fetchErrors++;
       this.emit("fetch_error");
       if (unavailable(err)) {
+        if (e) e.failedAt = Date.now();
         if (e && now - e.at < this.ttl + this.stale) {
           this.s.staleServed++;
           this.emit("stale");

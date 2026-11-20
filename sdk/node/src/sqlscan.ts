@@ -11,6 +11,8 @@ export interface SqlFinding {
 
 export const HANDLED_MARKER = "cryplus:handled";
 
+const STAR_IN_SELECT = /(?:\bselect\s+(?:distinct\s+(?:on\s*\([^)]*\)\s*)?)?|,\s*)(?:"?\w+"?\.)?\*(?=\s*(?:,|\bfrom\b|$))/i;
+
 const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /** Identifier match: not part of a longer word, optionally quoted, optionally schema-qualified. */
@@ -37,7 +39,9 @@ export function analyzeSql(schema: Schema, sql: string): SqlFinding[] {
     const cols = [...m.encrypted.values()].filter((e) => identRe(e.dbName).test(text)).map((e) => e.dbName);
     // count(*) is not "every column": blank it out before looking for a star
     const noCount = text.replace(/\bcount\s*\(\s*(?:distinct\s+)?(?:\w+\.)?\*\s*\)/gi, " count_all ");
-    const star = /\bselect\b[\s\S]*?(?:^|[\s,(])(?:\w+\.)?\*(?=[\s,)]|$)[\s\S]*?\bfrom\b/i.test(noCount) || /\breturning\s+\*/i.test(noCount);
+    // A select-list star is a `*` (or `alias.*`) that directly follows SELECT [DISTINCT] or a comma and is followed by a comma or FROM.
+    // Arithmetic such as `COUNT(...) * 100.0` or `x * y` is neither.
+    const star = STAR_IN_SELECT.test(noCount) || /\breturning\s+\*/i.test(noCount);
     const insertNoCols = new RegExp(`\\binsert\\s+into\\s+(?:\\w+\\.)?"?${esc(m.dbTable)}"?\\s*(values|select|default)`, "i").test(text);
     if (cols.length) {
       out.push({ model: m.name, table: m.dbTable, columns: cols, reason: `mentions encrypted column(s) ${cols.join(", ")}` });

@@ -10,13 +10,22 @@
  *   dynamic the SQL is assembled at runtime from something other than literals, so it cannot be analyzed
  *   info    direct driver use (`pg`) that is not analyzed at all
  *
+ * SQL assembled by helper functions cannot be read, but you can say what it touches:
+ *   // cryplus-columns: funcionarios.celular, tenants.telefone
+ * on the line(s) before the call. Those columns are then checked against the schema (an encrypted one is an error, a typo is an
+ * error, plain columns clear the "cannot analyze" note). `table.*` means every column of the table.
+ *
+ * It also reads Prisma calls (`prisma.mensagem.findMany({ ... })`) and reports what the extension would refuse at runtime:
+ * contains / startsWith / gt... on an encrypted field, equality on a field that is not `searchable`, and orderBy / groupBy(by) /
+ * distinct / _min _max _sum _avg on an encrypted field, so they are found in CI.
+ *
  * Silence a reviewed call with a comment on the line before it: `// cryplus-ignore-next-line: <reason>`,
  * or put `/* cryplus:handled *\/` inside the SQL text. `// cryplus-ignore-file` at the top skips a whole file.
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import * as path from "node:path";
 import { analyzeSql } from "./sqlscan.ts";
-import type { Schema } from "./schema.ts";
+import type { EncryptedField, ModelInfo, Schema } from "./schema.ts";
 
 export interface ScanFinding {
   file: string;
@@ -39,9 +48,11 @@ type Tok =
 const ID_START = /[A-Za-z_$]/;
 const ID_PART = /[\w$]/;
 
-function lex(src: string): { toks: Tok[]; ignoreLines: Set<number>; ignoreFile: boolean } {
+function lex(src: string): { toks: Tok[]; ignoreLines: Set<number>; ignoreFile: boolean; columnNotes: Map<number, string[]> } {
   const toks: Tok[] = [];
   const ignoreLines = new Set<number>();
+  /** line -> columns declared by a `// cryplus-columns:` comment placed up to three lines above it */
+  const columnNotes = new Map<number, string[]>();
   let ignoreFile = false;
   let i = 0;
   const n = src.length;
@@ -55,6 +66,12 @@ function lex(src: string): { toks: Tok[]; ignoreLines: Set<number>; ignoreFile: 
   const noteComment = (text: string, at: number) => {
     if (/cryplus-ignore-file/.test(text)) ignoreFile = true;
     if (/cryplus-ignore-next-line/.test(text)) ignoreLines.add(lineOf(at) + 1);
+    const cc = /cryplus-columns:\s*([^\n]*)/.exec(text);
+    if (cc) {
+      const cols = cc[1]!.replace(/\*\/\s*$/, "").split(/[\s,]+/).filter(Boolean);
+      const base = lineOf(at) + (text.split("\n").length - 1);
+      for (let d = 1; d <= 3; d++) if (!columnNotes.has(base + d)) columnNotes.set(base + d, cols);
+    }
   };
 
   function readTemplate(start: number): { tok: Tok; end: number } {
@@ -142,7 +159,7 @@ function lex(src: string): { toks: Tok[]; ignoreLines: Set<number>; ignoreFile: 
       i++;
     }
   }
-  return { toks, ignoreLines, ignoreFile };
+  return { toks, ignoreLines, ignoreFile, columnNotes };
 }
 
 // ---- analysis ----------------------------------------------------------------
@@ -266,8 +283,170 @@ function firstArg(toks: Tok[], k: number, consts: Map<string, Operand>): Operand
   return { text, dynamic: dyn };
 }
 
+/** Check the columns named by a `// cryplus-columns:` annotation against the schema. */
+function checkDeclaredColumns(schema: Schema, declared: string[]): string[] {
+  const out: string[] = [];
+  for (const d of declared) {
+    const [tbl, col] = d.split(".");
+    if (!tbl || !col) {
+      out.push(`cryplus-columns: "${d}" is not table.column`);
+      continue;
+    }
+    const m = [...schema.values()].find((x) => x.dbTable.toLowerCase() === tbl.toLowerCase() || x.name.toLowerCase() === tbl.toLowerCase());
+    if (!m) {
+      out.push(`cryplus-columns: unknown table "${tbl}" (use the database table name)`);
+      continue;
+    }
+    if (col === "*") {
+      if (m.encrypted.size) out.push(`${m.name} (${m.dbTable}): declared as every column, which includes encrypted ones`);
+      continue;
+    }
+    const enc = [...m.encrypted.values()].find((e) => e.dbName.toLowerCase() === col.toLowerCase() || e.name.toLowerCase() === col.toLowerCase());
+    if (enc) {
+      out.push(`${m.name} (${m.dbTable}): declared column ${enc.dbName} is encrypted`);
+      continue;
+    }
+    const known = [...m.fields.values()].some((f) => !f.relation && (f.dbName.toLowerCase() === col.toLowerCase() || f.name.toLowerCase() === col.toLowerCase()));
+    if (!known) out.push(`cryplus-columns: ${m.dbTable} has no column "${col}"`);
+  }
+  return out;
+}
+
+// ---- Prisma call analysis ------------------------------------------------------
+
+const PRISMA_OPS = new Set(["findMany", "findFirst", "findFirstOrThrow", "findUnique", "findUniqueOrThrow", "count", "aggregate", "groupBy", "update", "updateMany", "delete", "deleteMany", "upsert"]);
+const UNSUPPORTED_OPS = new Set(["contains", "startsWith", "endsWith", "gt", "gte", "lt", "lte", "search", "mode"]);
+const lowerFirst = (s: string) => s.charAt(0).toLowerCase() + s.slice(1);
+
+/** Index of the token that closes the bracket opened at toks[i] ("(" "[" "{"), or toks.length. */
+function closeOf(toks: Tok[], i: number): number {
+  let depth = 0;
+  for (let k = i; k < toks.length; k++) {
+    const x = toks[k]!;
+    if (x.t === "p" && "([{".includes(x.v)) depth++;
+    else if (x.t === "p" && ")]}".includes(x.v) && --depth === 0) return k;
+  }
+  return toks.length;
+}
+
+/** Token range [start, end) of the value after the `:` at toks[colon]. */
+function valueAfter(toks: Tok[], colon: number): [number, number] {
+  const start = colon + 1;
+  const first = toks[start];
+  if (first?.t === "p" && "([{".includes(first.v)) return [start, closeOf(toks, start) + 1];
+  let depth = 0;
+  let e = start;
+  while (e < toks.length) {
+    const y = toks[e]!;
+    if (y.t === "p" && "([{".includes(y.v)) depth++;
+    else if (y.t === "p" && ")]}".includes(y.v)) {
+      if (depth === 0) break;
+      depth--;
+    } else if (depth === 0 && y.t === "p" && y.v === ",") break;
+    e++;
+  }
+  return [start, e];
+}
+
+/** Encrypted fields visible from a model: its own and those of models reached through relations (two levels). */
+function fieldsInScope(schema: Schema, m: ModelInfo, depth = 2, seen = new Set<string>()): Map<string, EncryptedField> {
+  const out = new Map<string, EncryptedField>();
+  if (seen.has(m.name)) return out;
+  seen.add(m.name);
+  for (const [k, e] of m.encrypted) out.set(k, e);
+  if (depth > 0) {
+    for (const f of m.fields.values()) {
+      const rel = f.relation ? schema.get(f.relation) : undefined;
+      if (rel) for (const [k, e] of fieldsInScope(schema, rel, depth - 1, seen)) if (!out.has(k)) out.set(k, e);
+    }
+  }
+  return out;
+}
+
+function scanPrismaCalls(schema: Schema, toks: Tok[], add: (offset: number, sev: ScanFinding["severity"], call: string, msg: string) => void) {
+  const delegates = new Map<string, ModelInfo>();
+  for (const m of schema.values()) delegates.set(lowerFirst(m.name), m);
+  const isP = (x: Tok | undefined, v: string) => x?.t === "p" && x.v === v;
+  const idv = (x: Tok | undefined) => (x?.t === "id" ? x.v : undefined);
+
+  for (let k = 0; k + 4 < toks.length; k++) {
+    const d = toks[k]!;
+    const op = toks[k + 2]!;
+    if (d.t !== "id" || !delegates.has(d.v) || !isP(toks[k + 1], ".") || op.t !== "id" || !PRISMA_OPS.has(op.v) || !isP(toks[k + 3], "(")) continue;
+    const model = delegates.get(d.v)!;
+    const scope = fieldsInScope(schema, model);
+    if (scope.size === 0) continue;
+    const call = `${d.v}.${op.v}`;
+    const at = d.i;
+    const region = toks.slice(k + 4, closeOf(toks, k + 3));
+
+    const keysNamed = (names: string[]) => {
+      const hits: number[] = [];
+      for (let i = 0; i + 1 < region.length; i++) {
+        const x = region[i]!;
+        if ((x.t === "id" || x.t === "str") && names.includes(x.v) && isP(region[i + 1], ":")) hits.push(i);
+      }
+      return hits;
+    };
+
+    // operators / equality on encrypted fields inside where / having / cursor (at any nesting depth)
+    for (const wi of keysNamed(["where", "having", "cursor"])) {
+      const [vs, ve] = valueAfter(region, wi + 1);
+      for (let i = vs; i + 1 < ve; i++) {
+        const x = region[i]!;
+        if (x.t !== "id" || !isP(region[i + 1], ":")) continue;
+        const enc = scope.get(x.v);
+        if (!enc) continue;
+        const [fs, fe] = valueAfter(region, i + 1);
+        const v0 = region[fs];
+        if (idv(v0) === "null" || idv(v0) === "undefined") continue;
+        if (isP(v0, "{")) {
+          const ops = new Map<string, Tok | undefined>();
+          for (let j = fs + 1; j + 1 < fe - 1; j++) {
+            if (region[j]!.t === "id" && isP(region[j + 1], ":")) {
+              ops.set((region[j] as any).v, region[j + 2]);
+              j = valueAfter(region, j + 1)[1] - 1; // skip the operand (it can hold nested braces)
+            }
+          }
+          const bad = [...ops.keys()].filter((o) => UNSUPPORTED_OPS.has(o) && !(o === "endsWith" && enc.suffixes.length > 0));
+          if (bad.length) {
+            add(at, "error", call, `unsupported filter on encrypted field ${enc.name}: ${bad.join(", ")} (only equals, in, not, notIn${enc.suffixes.length ? ", endsWith" : ""} work, and only on @encrypted(searchable))`);
+          } else {
+            const onlyNotNull = ops.size === 1 && ops.has("not") && idv(ops.get("not")) === "null";
+            const eqOps = [...ops.keys()].filter((o) => o !== "endsWith");
+            if (eqOps.length && !onlyNotNull && !ops.has("isEmpty") && !enc.searchable && !enc.global && enc.kind === "string") {
+              add(at, "error", call, `filter on encrypted field ${enc.name} which is not @encrypted(searchable)`);
+            }
+          }
+        } else if (!enc.searchable && !enc.global && enc.kind === "string") {
+          add(at, "error", call, `equality filter on encrypted field ${enc.name} which is not @encrypted(searchable)`);
+        }
+        i = fe - 1;
+      }
+    }
+
+    // ordering / grouping / distinct / aggregates over ciphertext
+    const groups: [string, string][] = [["orderBy", "order by"], ["by", "group by"], ["distinct", "distinct on"], ["_min", "aggregate (_min)"], ["_max", "aggregate (_max)"], ["_sum", "aggregate (_sum)"], ["_avg", "aggregate (_avg)"]];
+    for (const [key, what] of groups) {
+      for (const ki of keysNamed([key])) {
+        const [vs, ve] = valueAfter(region, ki + 1);
+        for (let i = vs; i < ve; i++) {
+          const x = region[i]!;
+          const isKey = x.t === "id" && isP(region[i + 1], ":");
+          const isName = x.t === "str" || (x.t === "id" && key === "by" && !isKey);
+          const enc = isKey || isName ? scope.get(x.v) : undefined;
+          if (enc && (key !== "by" || isName)) {
+            add(at, "error", call, `cannot ${what} encrypted field ${enc.name}: ciphertext order and grouping are meaningless`);
+            break;
+          }
+        }
+      }
+    }
+  }
+}
+
 export function scanSource(schema: Schema, source: string, file: string): ScanFinding[] {
-  const { toks, ignoreLines, ignoreFile } = lex(source);
+  const { toks, ignoreLines, ignoreFile, columnNotes } = lex(source);
   if (ignoreFile) return [];
   const consts = constantsOf(toks);
   const findings: ScanFinding[] = [];
@@ -302,10 +481,14 @@ export function scanSource(schema: Schema, source: string, file: string): ScanFi
         add(t.i, "error", t.v, `${f.model} (${f.table}): ${f.reason}`);
       }
     }
-    if (op.dynamic) {
-      add(t.i, "dynamic", t.v, `cannot analyze: ${op.dynamic}. Review by hand, then add \`// cryplus-ignore-next-line: <reason>\``);
+    const declared = columnNotes.get(pos(t.i).line);
+    if (declared) {
+      for (const msg of checkDeclaredColumns(schema, declared)) add(t.i, "error", t.v, msg);
+    } else if (op.dynamic) {
+      add(t.i, "dynamic", t.v, `cannot analyze: ${op.dynamic}. Review by hand, then declare what it touches with \`// cryplus-columns: table.column, ...\` or add \`// cryplus-ignore-next-line: <reason>\``);
     }
   }
+  scanPrismaCalls(schema, toks, add);
   if (/require\(\s*['"]pg['"]\s*\)|from\s+['"]pg['"]|require\(\s*['"]mysql2?['"]\s*\)/.test(source)) {
     const m = /require\(\s*['"]pg['"]|from\s+['"]pg['"]/.exec(source);
     add(m?.index ?? 0, "info", "pg", "direct database driver in use: SQL sent through it is not analyzed by this scanner");

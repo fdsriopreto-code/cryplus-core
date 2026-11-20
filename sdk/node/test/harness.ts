@@ -74,8 +74,10 @@ export async function startCore(extraEnv: Record<string, string> = {}, o: CoreOp
     dir,
     auditPath,
     async stop() {
-      child.kill();
-      await new Promise((r) => child.once("exit", r));
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill();
+        await new Promise((r) => child.once("exit", r));
+      }
       try {
         rmSync(dir, { recursive: true, force: true });
       } catch {}

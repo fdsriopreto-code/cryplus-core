@@ -17,6 +17,8 @@ Options:
 
 Exit status: 0 clean, 1 findings (or unanalyzable SQL unless --allow-dynamic), 2 usage or schema error.
 Silence a reviewed call with  // cryplus-ignore-next-line: <reason>  on the line before it.
+Declare what helper-built SQL touches with  // cryplus-columns: table.column, ...  (up to three lines above the call): the columns are checked.
+Also reports Prisma calls the extension would refuse: contains/startsWith/gt on, orderBy/groupBy/distinct of, or equality on a non-searchable, encrypted field.
 `;
 
 function main(argv: string[]): number {

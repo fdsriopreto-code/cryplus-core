@@ -27,9 +27,18 @@ export interface FieldInfo {
   list: boolean;
   optional: boolean;
   isId: boolean;
+  /** `@default(...)` generator of the field, when it is one the extension can reproduce client-side. */
+  idDefault?: "uuid" | "cuid" | "ulid" | "nanoid" | "autoincrement" | "other";
   /** Target model name when this field is a relation. */
   relation?: string;
   native?: { name: "VarChar" | "Char"; length: number };
+}
+
+function defaultKind(rest: string): FieldInfo["idDefault"] {
+  const m = /@default\(\s*(?:\w+:\s*)?(\w+)\s*\(/.exec(rest);
+  if (!m) return /@default\(/.test(rest) ? "other" : undefined;
+  const n = m[1]!.toLowerCase();
+  return n === "uuid" || n === "cuid" || n === "ulid" || n === "nanoid" || n === "autoincrement" ? (n as any) : "other";
 }
 
 export interface SuffixIndex {
@@ -58,6 +67,11 @@ export interface ModelInfo {
   dbTable: string;
   fields: Map<string, FieldInfo>;
   idField?: string;
+  /**
+   * True when a row's ciphertexts can be bound to its primary key: a single `String` @id. Models with an Int/autoincrement
+   * or composite key cannot be bound (the id does not exist before the INSERT), and keep unbound ciphertexts.
+   */
+  bindable: boolean;
   encrypted: Map<string, EncryptedField>;
   /** Names of all companion index columns (hidden from results, never set by the app). */
   indexFields: Set<string>;
@@ -182,7 +196,7 @@ export function checkSchema(text: string): { schema: Schema; problems: SchemaPro
       const m = /^model\s+(\w+)\s*\{/.exec(line);
       if (m) {
         inModel = m[1]!;
-        models.set(inModel, { name: inModel, dbTable: inModel, fields: new Map(), encrypted: new Map(), indexFields: new Set(), compound: new Map() });
+        models.set(inModel, { name: inModel, dbTable: inModel, fields: new Map(), bindable: false, encrypted: new Map(), indexFields: new Set(), compound: new Map() });
         docs = [];
       } else if (/^(enum|type|view|datasource|generator)\s+\w+\s*\{/.test(line)) {
         inOther = true;
@@ -243,10 +257,15 @@ export function checkSchema(text: string): { schema: Schema; problems: SchemaPro
       list: rf.list,
       optional: rf.optional,
       isId: /@id\b/.test(rf.rest),
+      idDefault: defaultKind(rf.rest),
       relation: models.has(rf.type) ? rf.type : undefined,
       native: nat ? { name: nat[1] as "VarChar" | "Char", length: Number(nat[2]) } : undefined,
     });
     if (/@id\b/.test(rf.rest)) m.idField = rf.name;
+  }
+  for (const m of models.values()) {
+    const idf = m.idField ? m.fields.get(m.idField) : undefined;
+    m.bindable = !!idf && idf.type === "String" && !idf.list;
   }
 
   const bad = (model: string, field: string, message: string, fix?: string) => problems.push({ model, field, message, fix });

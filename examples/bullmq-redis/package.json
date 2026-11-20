@@ -1,0 +1,13 @@
+{
+  "name": "cryplus-bullmq-redis",
+  "private": true,
+  "description": "Job sealing against a REAL BullMQ and a REAL Redis (docker run redis:7-alpine) and a real cryplus-core.",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 bullmq.test.js"
+  },
+  "dependencies": {
+    "bullmq": "5.34.8",
+    "cryplus": "file:../../sdk/node",
+    "ioredis": "5.4.2"
+  }
+}

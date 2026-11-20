@@ -119,3 +119,22 @@ model Webhook {
 
   @@map("webhooks")
 }
+
+// Oracle models for the generated filter-equivalence test: `plain` and `enc` always hold the same values,
+// so any filter must select the same rows on both (the plaintext column is the oracle).
+model OraculoPai {
+  id       String    @id @default(uuid())
+  tenantId String
+  filhos   Oraculo[]
+}
+
+model Oraculo {
+  id       String      @id @default(uuid())
+  tenantId String
+  paiId    String?
+  pai      OraculoPai? @relation(fields: [paiId], references: [id])
+  plain    String?
+  /// @encrypted(searchable)
+  enc      String?
+  encIdx   String?
+}

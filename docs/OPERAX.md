@@ -3,8 +3,8 @@
 Based on two read-only surveys of the `metal-flow-back-end` repository (Express 4, plain JavaScript/CommonJS, Prisma 5.22 without a
 driver adapter, one `PrismaClient`, BullMQ + Redis, S3-compatible storage, `node:20-alpine`) and on the improvement requests the Operax
 team wrote from them. **This repository has never seen the Operax code.** What is verified here is the same stack in a faithful test
-project (`examples/prisma5-cjs`, 40 tests against real Postgres, in two modes: against a real `cryplus-core` and against the in-memory
-test client). Anything that depends on Operax itself is marked **VERIFY**.
+project (`examples/prisma5-cjs`: 40 compatibility tests in two modes (real `cryplus-core` and the in-memory
+test client), a 94-test oracle/feature suite, real BullMQ+Redis and Alpine/musl runs). Anything that depends on Operax itself is marked **VERIFY**.
 
 > **Correction.** An earlier version of this guide said "the column type does not change". That is wrong for `VarChar(n)` columns:
 > a 14-character CPF becomes a 183-character ciphertext. See [Column types and sizes](#column-types-and-sizes).
@@ -36,6 +36,23 @@ npx cryplus-scan --schema prisma/schema.prisma --src src
 
 It understands tagged templates (including nested `${}`), `Unsafe` calls, string concatenation, `Prisma.sql`, and same-file constants.
 Silence a reviewed call with `// cryplus-ignore-next-line: <reason>` on the line before it, or `/* cryplus:handled */` inside the SQL.
+SQL assembled by helper functions (`CANON('f.celular')` in `tenant.controller.js`) cannot be read, but you can **declare** what it touches on the line(s) before the call
+(up to three lines above), and then it is checked instead of ignored:
+
+```js
+// cryplus-columns: funcionarios.celular, tenants.telefone
+const rows = await prisma.$queryRawUnsafe(buildPhoneQuery(CANON('f.celular')), tenantId);
+```
+
+An encrypted column in the list is an error, so is a typo or an unknown table; `table.*` means every column. Plain columns clear the "cannot analyze" note for that call.
+
+The scanner also reads **Prisma calls** (`prisma.mensagem.findMany({...})`, `tx.x`, `this.prisma.x`) and reports what the extension would refuse at runtime, so it shows up in CI instead of in production:
+`contains/startsWith/gt/gte/lt/lte/search` on an encrypted field, equality on an encrypted field that is not `searchable`, and `orderBy` / `groupBy by` / `distinct` / `_min _max _sum _avg` on one.
+It follows relations two levels deep, so `conversa.findMany({ where: { mensagens: { some: { conteudo: { contains } } } } })` is found. It is a token-level reader, not a type checker: a same-named
+field on another model can produce a false positive (silence it with `cryplus-ignore-next-line`), and a query built in a variable is not seen.
+
+A `*` is reported only as a select-list star (after `SELECT`, `DISTINCT` or a comma, followed by a comma or `FROM`); `COUNT(...) * 100.0` is not one.
+
 It does **not** analyze SQL sent through a direct `pg` client (it lists those files as `info`). Run it on the Operax repo and treat
 "zero errors, every dynamic query reviewed" as the exit criterion for each wave.
 
@@ -141,6 +158,20 @@ A `VarChar` that is big enough is accepted when you state the plaintext maximum:
 | Substring / ILIKE | none | use `$cryplus.searchDecrypted` on a bounded set. An n-gram index is **not** implemented |
 | Ordering, distinct, groupBy, `_min/_max/_sum/_avg` | none | **throws** instead of returning wrong results; `count` works |
 
+### How filters on encrypted fields behave
+
+- **Equality only**, on `searchable` (per tenant) or `global` fields: `value`, `equals`, `in`, `not`, `notIn`, `null`, `not: null`, `endsWith` (with `suffix(n)`).
+  Everything else (`contains`, `startsWith`, `gt`, `mode`, `search`...) **throws**, also under `NOT`, `AND`, `OR`, in relation filters and in `_count`.
+- They work at any depth: `NOT`, `NOT: [...]`, `AND`, `OR`, relation `some/every/none/is/isNot`, `include { where }`, `_count { where }`. **Semantics are exactly those of a plaintext column**,
+  including SQL's treatment of `NULL` (Prisma's `NOT` and `not` do not return rows whose column is `NULL`). That is not an assumption: `examples/prisma5-cjs/oracle.test.js` runs
+  {equals, in, not, notIn, null, undefined, ...} x {top level, NOT, NOT[], AND, AND[NOT], OR, OR[NOT], NOT[OR], NOT[AND], NOT[NOT]} x {plain on a twin column, encrypted} and relation
+  `some/none/every` (also negated), and requires identical row sets (66 tests, real Postgres). Add your own filter shapes to its `LEAVES` / `POSITIONS` lists.
+- **Fail closed.** After rewriting, every filter is walked once more; a condition on an encrypted column that was not rewritten is refused (`filter on an encrypted field was not
+  rewritten`) instead of being sent. `orderBy` is checked through relations too.
+- **`undefined` means "no filter"**, exactly as in Prisma (top level, inside `AND/OR/NOT`, as an operand, in `where` of a relation, in compound keys).
+- If a query returns rows you do not expect, first check that it goes through the **extended** client: a second `PrismaClient`, or the base client, bypasses the extension (it then compares
+  plaintext with ciphertext and matches nothing, or everything under a negation). Keep a single exported, extended client.
+
 Normalizers (applied to the stored value and to every filter value): `trim` (always), `lowercase`, `digits`, `fold` (lowercase + strip accents, the effect
 of `translate(lower(x), 'áàãâéêíóôõúüç', 'aaaaeeiooouuc')`), `email-lower`, `br-phone-canonical`.
 `br-phone-canonical` as specified from the survey: digits only; drop a leading `55` when the number has 12 or 13 digits; for an 11-digit mobile number drop the
@@ -149,6 +180,18 @@ extra `9` after the DDD (so `(11) 91234-5678`, `11912345678`, `+55 11 91234-5678
 
 Compound unique keys keep working: after moving uniqueness to the index (`@@unique([tenantId, cpfIdx])`) code that calls
 `findUnique({ where: { tenantId_cpf: { tenantId, cpf } } })`, `upsert` or `update` with that key is rewritten automatically (tested).
+
+### A searchable field on a table that already has data (safe order)
+
+While a table is half-migrated, a plaintext row has an **empty index column**, so an equality lookup does not see it and a "CPF already registered" check lets a duplicate through. Order:
+
+1. Add the index column (additive migration) and deploy code with the `/// @encrypted(searchable)` comment.
+2. **`migrateModel({ mode: 'index-only' })`**: fills the index of every row, **including rows that are still plaintext** (it computes the index from the plaintext and leaves the value alone).
+3. Deploy the equality code. From here a lookup finds old and new rows.
+4. `migrateModel({ mode: 'all' })` encrypts the values (the index is already there).
+
+If code that depends on equality must go out *before* step 2 finishes, use `legacy: 'fallback'` for the window: `{ f: X }` becomes `OR [{ fIdx: idx(X) }, { f: X }]` (equals / in only; `not`/`notIn`
+throw in this mode, equality under `NOT` is fine). Turn it off once the backfill is done: it costs an extra OR and exists only for the window.
 
 ## Tests with encryption ON, no network
 
@@ -175,12 +218,18 @@ new Worker('pdf-generation', encryptedWorker(cryplus, async (job) => { /* job.da
 
 The payload is bound to the queue and job name (replay into another queue or job type is refused) and the worker runs inside `withTenant(job tenant)`, so Prisma works with no extra code.
 Still in clear in Redis: job name, options, the **tenant id**. Not covered: `returnvalue`, `failedReason`, stack traces and logs (do not put secrets in them), `job.updateData`, repeatable-job keys you build from data.
-Passing only an id and letting the worker read the row is better than sealing. Tested with a stand-in for BullMQ that records exactly what would be written to Redis;
-**not tested against a real Redis/BullMQ** (none available here): **VERIFY** in staging. `allowPlain` (default true) lets jobs enqueued before the rollout still run.
+Passing only an id and letting the worker read the row is better than sealing. Tested against a **real BullMQ 5 and a real Redis 7** (`examples/bullmq-redis`, needs Docker, 10 tests): the whole Redis keyspace (hashes, lists, sorted sets, streams) is searched for the
+plaintext after enqueue, during a failing attempt and after completion; retries with backoff, `addBulk`, delayed and prioritised jobs, replay into another queue, `allowPlain`, and no-tenant fail-closed.
+The same test shows the limit: a **return value** or an **error message** that contains the data is stored in clear. The hand-over to your own queue code in staging is still yours to **VERIFY**. `allowPlain` (default true) lets jobs enqueued before the rollout still run.
 
 ## Availability and latency
 
-Default mode: every operation goes to the key service, batched per event-loop tick (a 200-row list is one round trip per Prisma call). Opt-in **key cache** mode:
+Default mode: every operation goes to the key service (concurrent operations share the connection pool; there is no multi-operation batch endpoint, so a 200-row list is 200 small requests issued together).
+**A write no longer pays a second round trip**: the values `create`/`update`/`upsert` just encrypted are remembered for that one operation, so the row Prisma returns is read back
+**without calling `decrypt`** (a later `find` still decrypts; nothing is cached across operations). Measured on one machine (Windows, local Postgres 17 on loopback, real `cryplus-core`, 300 sequential creates of a
+row with one encrypted field; `examples/prisma5-cjs/bench.js`, run it on yours): plain 1.8 ms p50, encrypted **3.4 ms** p50 (p95 17 ms), encrypted with the key cache **2.3 ms**; `findFirst` 1.3 ms plain, 2.7 ms encrypted.
+Your own measurement was +4 to 9 ms per write: that includes the decrypt round trip that is now gone, but the service-over-the-network case (not loopback) will be slower than these numbers.
+Opt-in **key cache** mode:
 
 ```js
 const cryplus = new Cryplus({ keyCache: { ttlMs: 300_000, staleMs: 60_000 } });   // needs the 'keys' role and --allow-key-export on the core
@@ -196,6 +245,11 @@ Interoperates byte for byte with the service (both directions, both ciphers), ve
 | Tenant never seen (cold) | **fails closed**: `key_service_unavailable` |
 | Past `ttlMs + staleMs` | fails closed |
 | Service back | recovers by itself (circuit breaker half-opens) |
+
+While the service is down, an expired-but-still-usable key is **not re-fetched on every operation**: after a failed refresh the cache keeps serving the stale key and retries after `retryMs` (default 1000).
+(Found by a mixed-load test: without this, every operation during an outage tried to reach the dead service: 907 failed fetches in 1.5 s instead of 50.)
+Mixed load, real core (`test/keycache.test.ts`): 8 workers, 5 tenants, local and service paths side by side, a **key rotation and a service restart in the middle**: 1879 writes, 1858 reads, 411 blind indexes,
+0 errors; everything written (before, during and after the outage, by either path) opens by both paths; cache hit ratio above 0.9.
 
 **The trade-off:** the tenant key now lives in this process's memory, individual operations are no longer audited by the service (only key fetches are), and a revoked service keeps working
 until its cached keys expire (`ttlMs`). Rotation reaches this process after `ttlMs`. Keep `ttlMs` short and give the token a narrow `tenants` allowlist.
@@ -227,7 +281,9 @@ RUN npm ci --omit=dev          # package.json: "cryplus": "file:vendor/cryplus-0
 ```
 
 (`npm i ./vendor/cryplus-0.3.0.tgz` writes that line.) Publishing to a private registry or npm is equally fine; the name `cryplus` is unclaimed on npm and publishing is your decision.
-Not run on an actual Alpine image here (no Docker): **VERIFY** the first build.
+Run on an actual image: `examples/alpine/run.ps1` packs the tarball, installs it with `--omit=dev` into **`node:20-alpine` (Node 20.20, musl)** next to Prisma 5.22.0, cross-compiles a linux `cryplus-core`, starts
+`postgres:16-alpine`, and runs 8 checks (service and key-cache local crypto interoperating on musl, the extension with searchable/global/suffix/array/json fields, row binding, `tenantFrom`, raw guard, transactions,
+`migrateModel`/`rotateModel`, `cryplus-scan`): all pass. **Prisma itself needs `openssl` in an Alpine image** (`apk add openssl`); that is Prisma's requirement, not Cryplus's. Your own Dockerfile and base image remain yours to **VERIFY**.
 
 **A second Prisma client.** If any code creates another `new PrismaClient()` instead of using the extended singleton, it reads and writes raw ciphertext without any error. Operax has one in `src/config/prisma.js`;
 `operax-agente` has its own Prisma and database (a separate integration with the same service). Run `cryplus-scan` and `grep -rn "new PrismaClient"` to be sure.
@@ -257,6 +313,18 @@ if (process.env.CRYPLUS_URL) {
 module.exports = prisma;
 ```
 
+Options worth knowing (all optional, all in `withCryplus(base, {...})`):
+
+| Option | What it does |
+|---|---|
+| `tenant: ({ model }) => ...` | Tenant for a model before the ambient one (e.g. `Tenant` -> `__platform__`) |
+| `tenantFrom: { Mensagem: { via: 'conversaId', model: 'Conversa' } }` | Tables with no tenant column: the tenant is that of the parent row (see below) |
+| `tenantFromArgs: true` | Also derive the tenant of models that have a `tenantId` column from `data/where/create` (**off by default**, see below) |
+| `plaintext: { default: 'allow', Mensagem: 'reject' }` | Reject plaintext reads per model for a staged rollout (or `'reject'` / `'allow'` for all) |
+| `rowBinding: 'on'` or `'strict'` | Bind each ciphertext to its row id (see [Row binding](#row-binding)) |
+| `legacy: 'fallback'` | Equality also matches rows that are still plaintext, during a migration |
+| `rawGuard`, `metrics`, `hideIndexFields` | as before |
+
 `module.exports` must be the extended client everywhere. **Never turn Cryplus off once any column has been encrypted**: the app would read ciphertext
 (to remove it, run `revertModel` for every model first).
 
@@ -267,6 +335,14 @@ Wrap the authenticated request once, in `auth.middleware.js`, right after `req.t
 ```js
 const { withTenant } = require('cryplus');
 return withTenant(req.tenantId, () => next());
+```
+
+or, as Express middleware (async getter allowed; returning nothing leaves the request without a tenant, e.g. login and webhooks):
+
+```js
+const { cryplusTenantMiddleware } = require('cryplus');
+app.use(authenticate);
+app.use(cryplusTenantMiddleware((req) => req.tenantId));
 ```
 
 (or point the `tenant` option at your own `AsyncLocalStorage` store in `contexto.js`). Outside a request you must set it yourself, otherwise the call **fails closed** with `no tenant for <Model>`:
@@ -281,6 +357,46 @@ return withTenant(req.tenantId, () => next());
 | Login (looks up `Usuario` by e-mail before the tenant is known) | `@encrypted(global)` on the e-mail if you must encrypt it; otherwise leave it |
 
 A tenant mismatch never leaks: decrypting under the wrong tenant is refused.
+
+**Tables without a tenant column** (Operax: `Mensagem`, owned through `Conversa`) are declared once instead of with a hand-written resolver:
+
+```js
+withCryplus(base, { cryplus, schemaPath, tenantFrom: { Mensagem: { via: 'conversaId', model: 'Conversa' } } });
+```
+
+Without an ambient tenant the tenant is found from, in order: `data/create/where.conversaId`; `where: { conversa: { is: { tenantId } } }` (or `{ conversa: { tenantId } }`); a `conversa: { connect: { id } }`;
+a nested create under the parent; and finally `where: { id }` alone (the row is looked up). `createMany` works when every row has the same `conversaId` and is refused (`no tenant for Mensagem`) when
+they differ. Lookups go through the base client, are cached (a row never changes tenant; 10 000 entries) and are skipped entirely when an ambient tenant exists. A lookup made inside an
+interactive `$transaction` runs outside it, so it cannot see a parent created in the same transaction: set `withTenant` there (signup does).
+
+**Why `tenantId` columns are not derived from the query by default.** The ambient tenant is the authorisation context: a handler that forgot `withTenant` must **fail**, not decrypt whatever tenant
+its `where` names. `tenantFromArgs: true` opts in for models that have a `tenantId` column (data/create/where, or a lookup for `where: { id }`); models in `tenantFrom` always derive.
+
+## Row binding
+
+By default a ciphertext is bound to its **tenant, collection and field**. Someone who can write to the database can still swap the stored values of two rows of the same tenant and field; reading either row then
+returns the other row's data **without any error** (measured on Operax's copy; cross-tenant swaps are already detected). `rowBinding` puts the row's primary key into what is authenticated, so that swap fails with
+`decryption_failed` on read.
+
+```js
+withCryplus(base, { cryplus, schemaPath, rowBinding: 'on' });   // 1. new writes are bound; old (unbound) values still read
+// 2. bind what exists, per model, with the base client:
+await rotateModel(base, cryplus, schema, { model: 'Webhook', tenantOf: (r) => r.tenantId, bindRows: true, verify: { sample: 0.05 }, concurrency: 4 });
+// 3. then refuse unbound values:  rowBinding: 'strict'
+```
+
+What it changes, deliberately:
+
+- Applies to models with a single `String` `@id`. `Int`/autoincrement and composite keys cannot be bound (the id does not exist before the INSERT): those models keep working unbound.
+- The extension **generates the id before encrypting** (`uuid()`, `cuid()`, `ulid()`, `nanoid()` defaults; `cuid` values are cuid-shaped, not byte-identical to Prisma's generator) or uses the id you supply.
+- `update`, `upsert` and nested updates that write an **encrypted value** must identify the row by `where: { id }` (an `id` in the `where` is enough, other filters may be added). `update` by `tenantId_cpf`,
+  `updateMany` with an encrypted value, and `upsert` by a compound key are **refused** with a message naming the fix, because each row needs its own ciphertext. Writing `null` or plain columns is unaffected.
+- A `select` without the id still works: the id is added to the query and removed from the result (also in nested selects). Raw helpers: `decryptRows` reads the id column from the rows (select it),
+  `encryptValue` / `decryptValue` take `{ recordId }`.
+- Turning it **off** again after rows were bound makes those rows unreadable (they would be opened without their id). Rollback is `revertModel` (which opens both kinds), not flipping the option.
+- `rotateModel` after a key rotation re-wraps bound values correctly with or without `bindRows`.
+- A value written before binding was enabled still reads in `'on'` (it is tried without the id when the bound attempt fails: one extra call per legacy value). In that window a swap of two **legacy** values is
+  still possible; `'strict'` closes it.
 
 ## Wave 1: schema and migration
 
@@ -329,13 +445,15 @@ const p = { model: 'Tenant', tenantOf: () => '__platform__' };
 
 await migrateModel(base, cryplus, schema, { ...p, dryRun: true });                       // counts, writes nothing
 const s = await migrateModel(base, cryplus, schema, { ...p, batchSize: 200, throttleMs: 50, verify: true });
-// s: { scanned, encrypted, rewrapped, indexed, verified, failures: [{ id, field, error }], lastId, aborted }
+// s: { scanned, encrypted, rewrapped, rebound, indexed, verified, failures: [{ id, field, error }], lastId, aborted, total, rowsPerSec, etaSec }
 ```
 
 - **Idempotent and resumable**: `lastId` from a run goes into `startAfter`; `maxFailures` stops early. Every failure is listed per row and field.
 - **Live system**: `throttleMs` sleeps between batches; `batchSize` bounds each read. Run it while users work and watch the database.
-- **`verify: true`** reads every changed row back and checks each field decrypts to what was meant to be stored.
-- **Modes**: `all` (encrypt plaintext, re-wrap, backfill indexes), `index-only` (columns that are already encrypted but whose index columns are new or empty), `rewrap-only`.
+- **`verify: true`** reads every changed row back and checks each field decrypts to what was meant to be stored, through a fresh state (it never trusts what the same run just encrypted). `verify: { sample: 0.05 }` checks about 5 %.
+- **Speed**: `concurrency: 4` writes four rows at a time (default 1; mind the Prisma connection pool). `onProgress` receives `scanned`, `total`, `rowsPerSec` and `etaSec`; the final stats carry `elapsedMs`. Writes are one `UPDATE` per row (a bulk
+  `UPDATE ... FROM (VALUES ...)` is **not** implemented): measure with your data and tune `concurrency` and `batchSize`.
+- **Modes**: `all` (encrypt plaintext, re-wrap, backfill indexes), `index-only` (fill missing index columns, for encrypted **and** still-plaintext rows), `rewrap-only`. `bindRows: true` also binds values to their rows.
 - **Key rotation without downtime**: `await cryplus.rotateKeys()`, then `rotateModel(base, cryplus, schema, { model, tenantOf, ... })` per model. Old ciphertext keeps working throughout.
 - **Rollback**: `revertModel` writes plaintext back (all kinds; index columns stay), idempotent. Put secrets back in clear text only deliberately.
 - **Adding an index column to a big table**: (1) add the nullable column (additive migration, no lock beyond the DDL); (2) deploy code that writes it; (3) backfill with `migrateModel(..., { mode: 'index-only', throttleMs })`;

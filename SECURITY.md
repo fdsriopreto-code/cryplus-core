@@ -21,7 +21,8 @@ for a vulnerability. Include the version/commit, what you could do, and a minima
 ## What it does not protect (by design)
 
 - A compromised application server or any holder of a service token can request decryption of what that service may read.
-- Row swaps within one tenant and field are not detected (no row-id binding yet).
+- Row swaps within one tenant and field are not detected **unless `rowBinding` is on** (Prisma extension, opt-in, single `String` id models only; see `docs/OPERAX.md`).
+  In `rowBinding: "on"`, values written before it was enabled still read (and can still be swapped among themselves) until `rotateModel({ bindRows: true })` + `"strict"`.
 - Blind indexes reveal equality and frequency of values.
 - Raw SQL and any path that bypasses the SDK sees ciphertext; availability depends on the key service.
 - Loss of the key file or its passphrase is unrecoverable.
